@@ -1,0 +1,2 @@
+jpvanhal/inflection @ 0.5.1
+https://github.com/jpvanhal/inflection/tree/0.5.1

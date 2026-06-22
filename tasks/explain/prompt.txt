@@ -1,0 +1,1 @@
+Read inflection.py in this directory. Then write an explanation to a new file named NOTES.md that covers: (1) what this module is for, (2) the main capabilities it provides, and (3) how the pieces fit together.

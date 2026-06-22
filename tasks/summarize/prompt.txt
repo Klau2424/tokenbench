@@ -1,0 +1,1 @@
+Read the file inflection.py in this directory. For each public function (those whose name does not start with an underscore), write a one-paragraph summary of what it does to a new file named NOTES.md. Use one section per function with the function name as the heading.
