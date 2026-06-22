@@ -135,7 +135,7 @@ Requires Python ≥ 3.11 and [Claude Code](https://claude.ai/code) installed and
 authenticated.
 
 ```bash
-git clone <this-repo> && cd token_reduction
+git clone <this-repo> && cd tokenbench
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
@@ -182,7 +182,7 @@ rig is worth building before any technique is worth measuring.
 
 See [`RESEARCH.md`](RESEARCH.md) for the full decision log (token capture method,
 environment constraints, both experiments run, honest account of what worked and what
-didn't), and [`V1_PLAN.md`](V1_PLAN.md) for the next stage.
+didn't).
 
 ---
 
