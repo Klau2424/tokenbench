@@ -13,9 +13,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import quality
 from .experiment import Arm, Experiment
 
 # Path to the dry-run stub that mimics claude's JSON output for $0.
@@ -147,7 +149,59 @@ def reset_fixture(fixture_dir: Path, artifact: str) -> None:
         target.unlink()
 
 
-def run_once(exp: Experiment, arm: Arm, run_index: int, base_cmd: list[str]) -> dict:
+ARTIFACT_TEXT_CAP = 12000  # store enough output to re-judge later without bloating runs.jsonl
+
+
+def score_artifact(rec: dict, artifact_path: Path, expected_symbols: tuple[str, ...]) -> None:
+    """Attach output-quality (coverage) to a record from the run's artifact.
+
+    Done while the temp workdir still exists (before cleanup). Fields are always set so
+    every record has them; ``output_quality`` is ``None`` when there is nothing to score —
+    no expected symbols, or no readable artifact (e.g. an invalid run that wrote nothing).
+    """
+    rec["output_quality"] = None
+    rec["quality_detail"] = None
+    if not expected_symbols:
+        return
+    try:
+        text = Path(artifact_path).read_text(encoding="utf-8")
+    except OSError:
+        return
+    detail = quality.CoverageScorer(expected_symbols).score(text)
+    rec["output_quality"] = detail["quality"]
+    rec["quality_detail"] = detail
+
+
+def read_artifact_text(rec: dict, artifact_path: Path) -> None:
+    """Persist the run's output text (capped) so it can be re-judged later without re-running."""
+    try:
+        rec["artifact_text"] = Path(artifact_path).read_text(encoding="utf-8")[:ARTIFACT_TEXT_CAP]
+    except OSError:
+        rec["artifact_text"] = None
+
+
+def score_judge(rec: dict, judge_scorer, artifact_text: str) -> None:
+    """Attach LLM-judge quality (0-10 graded against the task) to a record.
+
+    Defensive on purpose: a judge failure — subprocess error, timeout, unparseable reply —
+    records ``judge_error`` and leaves ``judge_quality`` None rather than crashing the run.
+    During a long unattended experiment one bad judge call must not lose the whole batch.
+    """
+    rec["judge_quality"] = None
+    rec["judge_score"] = None
+    rec["judge_reason"] = None
+    rec["judge_error"] = None
+    try:
+        out = judge_scorer.score(artifact_text)
+        rec["judge_quality"] = out["judge_quality"]
+        rec["judge_score"] = out["judge_score"]
+        rec["judge_reason"] = out["judge_reason"]
+    except Exception as e:  # noqa: BLE001 - a judge call must never abort a run
+        rec["judge_error"] = f"{type(e).__name__}: {e}"[:200]
+
+
+def run_once(exp: Experiment, arm: Arm, run_index: int, base_cmd: list[str],
+             batch_id: str | None = None, judge=None) -> dict:
     """Execute a single headless run in an isolated temp copy of the fixture.
 
     Each run gets a fresh copy of the fixture under the system temp dir (outside the dev
@@ -155,6 +209,9 @@ def run_once(exp: Experiment, arm: Arm, run_index: int, base_cmd: list[str]) -> 
     because the temp dir has no parent ``CLAUDE.md``, no project/workspace memory leaks
     into the context — the same isolation ``--bare`` would give, but without breaking
     OAuth auth.
+
+    The output artifact is scored for coverage *inside* this temp copy, before it is
+    deleted — that is the quality axis paired with the token counts.
     """
     cmd = build_command(
         base_cmd, exp.prompt, exp.model, exp.allowed_tools,
@@ -174,6 +231,10 @@ def run_once(exp: Experiment, arm: Arm, run_index: int, base_cmd: list[str]) -> 
         except subprocess.TimeoutExpired:
             rec = parse_result("", 124)
             rec["error"] = f"timeout after {exp.timeout_s}s"
+        score_artifact(rec, workdir / exp.artifact, exp.expected_symbols)
+        read_artifact_text(rec, workdir / exp.artifact)
+        if judge is not None and rec.get("valid") and rec.get("artifact_text"):
+            score_judge(rec, judge, rec["artifact_text"])
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -183,38 +244,70 @@ def run_once(exp: Experiment, arm: Arm, run_index: int, base_cmd: list[str]) -> 
         run_index=run_index,
         timestamp=started.isoformat(),
         config_hash=config_hash(exp, arm),
+        batch_id=batch_id,
     )
     return rec
 
 
+def _build_judge(exp: Experiment, base_cmd: list[str]):
+    """An isolated, time-bounded JudgeScorer that grades each artifact against the task.
+
+    The judge subprocess runs in a fresh temp cwd (no project ``CLAUDE.md`` to bias it) using
+    the same binary as the task (real ``claude``, or the stub for dry runs)."""
+    def _judge_run(cmd: list[str]) -> str:
+        d = Path(tempfile.mkdtemp(prefix="tokenbench-judge-"))
+        try:
+            proc = subprocess.run(cmd, cwd=d, capture_output=True, text=True, timeout=exp.timeout_s)
+            return proc.stdout
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    return quality.JudgeScorer(exp.prompt, runner=_judge_run, base_cmd=tuple(base_cmd))
+
+
 def run_experiment(exp: Experiment, base_cmd: list[str] | None = None,
-                   dry_run: bool = False) -> Path:
+                   dry_run: bool = False, fresh: bool = False, judge: bool = False) -> Path:
     """Run all arms, interleaved, appending each record to ``runs.jsonl`` as it completes.
 
     Interleaving (round-robin over arms within each repetition) spreads any time-correlated
     drift evenly across arms instead of blocking one arm entirely before the other.
+
+    By default this **accumulates** replications: records are appended and every record in
+    this batch is tagged with a shared ``batch_id`` (and ``batch_started``) so reports can
+    pool more data over time or split by batch. Pass ``fresh=True`` to truncate first (the
+    old v0 behavior) when starting a clean experiment.
     """
     if base_cmd is None:
         base_cmd = [sys.executable, str(STUB)] if dry_run else ["claude"]
 
+    judge_scorer = _build_judge(exp, base_cmd) if judge else None
+
     runs_path = exp.runs_file()
     runs_path.parent.mkdir(parents=True, exist_ok=True)
-    # Fresh file per experiment run so reports never mix sessions.
-    runs_path.write_text("", encoding="utf-8")
+    if fresh:
+        runs_path.write_text("", encoding="utf-8")
+
+    batch_started = datetime.now(timezone.utc)
+    batch_id = batch_started.strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
 
     with open(runs_path, "a", encoding="utf-8") as fh:
         for i in range(exp.n):
             for arm in exp.arms:
-                rec = run_once(exp, arm, i, base_cmd)
+                rec = run_once(exp, arm, i, base_cmd, batch_id=batch_id, judge=judge_scorer)
+                rec["batch_started"] = batch_started.isoformat()
                 fh.write(json.dumps(rec) + "\n")
                 fh.flush()
                 status = "ok " if rec["valid"] else "BAD"
                 cost = rec["total_cost_usd"]
                 cost_s = f"${cost:.4f}" if isinstance(cost, (int, float)) else "n/a"
+                q = rec.get("output_quality")
+                q_s = f"{q:.2f}" if isinstance(q, (int, float)) else "n/a"
+                j = rec.get("judge_score")
+                j_s = f" j={j:.0f}/10" if isinstance(j, (int, float)) else ""
                 print(
                     f"[{status}] {arm.name:<9} run {i}  "
                     f"in={rec['input_tokens']:>7} out={rec['output_tokens']:>6} "
-                    f"cost={cost_s}",
+                    f"cost={cost_s} cov={q_s}{j_s}",
                     flush=True,
                 )
 

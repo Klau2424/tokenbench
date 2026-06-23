@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import statistics
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 # Two-sided significance level for the "are the arms separated?" verdict.
 ALPHA = 0.05
@@ -185,6 +186,49 @@ def required_n_for_d(d: float | None, z_alpha: float = Z_ALPHA_TWO_SIDED_05,
     return 2.0 * (z_alpha + z_power) ** 2 / (d * d)
 
 
+def bootstrap_ci(a: list[float], b: list[float],
+                 stat: Callable[[list[float], list[float]], float],
+                 n_resamples: int = 2000, alpha: float = 0.05,
+                 seed: int = 0) -> dict | None:
+    """Percentile bootstrap CI for ``stat(a, b)`` (e.g. a difference of means).
+
+    Resamples each arm with replacement ``n_resamples`` times and takes the central
+    ``1-alpha`` percentile interval. ``seed`` fixes the RNG so the interval is reproducible
+    (and unit-testable). Returns ``None`` when either arm has n<2. Pure stdlib (``random``).
+    """
+    na, nb = len(a), len(b)
+    if na < 2 or nb < 2:
+        return None
+    rng = random.Random(seed)
+    estimates: list[float] = []
+    for _ in range(n_resamples):
+        ra = [a[rng.randrange(na)] for _ in range(na)]
+        rb = [b[rng.randrange(nb)] for _ in range(nb)]
+        estimates.append(stat(ra, rb))
+    estimates.sort()
+    lo = estimates[int((alpha / 2) * n_resamples)]
+    hi = estimates[min(int((1 - alpha / 2) * n_resamples), n_resamples - 1)]
+    return {"point": stat(a, b), "lo": lo, "hi": hi, "level": 1.0 - alpha}
+
+
+def _present(records: Iterable[dict], key: str,
+             transform: Callable[[float], float] | None = None) -> list[float]:
+    """Values for ``key`` across records, skipping records that lack it (older data may
+    not carry newer fields like ``output_quality``). Optional ``transform`` per value."""
+    out: list[float] = []
+    for r in records:
+        v = r.get(key)
+        if v is None:
+            continue
+        out.append(transform(v) if transform else v)
+    return out
+
+
+def _pct_reduction_stat(base: list[float], treat: list[float]) -> float:
+    bm = statistics.mean(base)
+    return (bm - statistics.mean(treat)) / bm * 100.0 if bm else 0.0
+
+
 def compare_arms(records: list[dict], baseline: str, treatment: str) -> dict:
     """Build the full per-arm summary plus the baseline->treatment comparison.
 
@@ -223,6 +267,61 @@ def compare_arms(records: list[dict], baseline: str, treatment: str) -> dict:
         d = (statistics.mean(base_vals) - statistics.mean(treat_vals)) / pooled
     ttest = welch_ttest(base_vals, treat_vals)
 
+    # Quality axis (coverage): higher is better, so framed as CHANGE, not reduction. Only
+    # present when records carry output_quality (v1+); older data simply omits it.
+    base_q, treat_q = _present(base_recs, "output_quality"), _present(treat_recs, "output_quality")
+    quality = None
+    if base_q and treat_q:
+        bq, tq = statistics.mean(base_q), statistics.mean(treat_q)
+        quality = {
+            "baseline_mean": bq,
+            "treatment_mean": tq,
+            "delta": tq - bq,  # negative => the terse arm lost completeness
+            "n_base": len(base_q),
+            "n_treat": len(treat_q),
+            "ci": bootstrap_ci(base_q, treat_q,
+                               lambda a, b: statistics.mean(b) - statistics.mean(a)),
+        }
+
+    # LLM-judge quality (0-10), graded against the task. Present only when records carry
+    # judge_score (i.e. the run used --judge). Framed as CHANGE, like coverage.
+    base_jq, treat_jq = _present(base_recs, "judge_score"), _present(treat_recs, "judge_score")
+    judge = None
+    if base_jq and treat_jq:
+        bjq, tjq = statistics.mean(base_jq), statistics.mean(treat_jq)
+        judge = {
+            "baseline_mean": bjq,
+            "treatment_mean": tjq,
+            "delta": tjq - bjq,
+            "n_base": len(base_jq),
+            "n_treat": len(treat_jq),
+            "ci": bootstrap_ci(base_jq, treat_jq,
+                               lambda a, b: statistics.mean(b) - statistics.mean(a)),
+        }
+
+    # Latency in seconds, framed as reduction (a faster terse arm => positive).
+    base_dur = _present(base_recs, "duration_ms", lambda v: v / 1000.0)
+    treat_dur = _present(treat_recs, "duration_ms", lambda v: v / 1000.0)
+    latency = None
+    if base_dur and treat_dur:
+        bd, td = statistics.mean(base_dur), statistics.mean(treat_dur)
+        latency = {
+            "baseline_mean_s": bd,
+            "treatment_mean_s": td,
+            "pct_reduction": (bd - td) / bd * 100.0 if bd else None,
+        }
+
+    # Power: per-arm n needed to detect the observed effect at 80% power, and whether the
+    # current sample meets it. Flags underpowered comparisons honestly.
+    n_per_arm = min(len(base_vals), len(treat_vals))
+    req_n = required_n_for_d(abs(d) if d is not None else None)
+    power = {
+        "observed_d": d,
+        "required_n": req_n,
+        "n_per_arm": n_per_arm,
+        "underpowered": (req_n is not None and n_per_arm < req_n),
+    }
+
     return {
         "baseline": baseline,
         "treatment": treatment,
@@ -235,6 +334,11 @@ def compare_arms(records: list[dict], baseline: str, treatment: str) -> dict:
         "p_value": ttest["p"],
         "alpha": ALPHA,
         "separated": (ttest["p"] is not None and ttest["p"] < ALPHA),
+        "quality": quality,
+        "judge": judge,
+        "latency": latency,
+        "power": power,
+        "primary_ci": bootstrap_ci(base_vals, treat_vals, _pct_reduction_stat),
     }
 
 
@@ -296,12 +400,73 @@ def format_report(comparison: dict) -> str:
         else:
             verdict = f"NOT SEPARATED — difference not significant (p >= {alpha})"
     lines.append(f"primary lever: {comparison['primary_metric']}   {stat_str}   Cohen's d = {d_str}")
+
+    pci = comparison.get("primary_ci")
+    if pci is not None:
+        lines.append(
+            f"  output-token reduction: {pci['point']:+.1f}%  "
+            f"[{int(pci['level'] * 100)}% CI {pci['lo']:+.1f}%, {pci['hi']:+.1f}%]"
+        )
+
+    # Quality axis — the v1 addition: a token cut is only good if coverage holds.
+    q = comparison.get("quality")
+    if q is not None:
+        q_ci = q.get("ci")
+        ci_s = ""
+        if q_ci is not None:
+            ci_s = f"  [{int(q_ci['level'] * 100)}% CI {q_ci['lo']:+.2f}, {q_ci['hi']:+.2f}]"
+        lines.append(
+            f"quality (coverage): {q['baseline_mean']:.2f} -> {q['treatment_mean']:.2f}  "
+            f"(change {q['delta']:+.2f}){ci_s}"
+        )
+
+    # Judge quality — catches the prose-depth loss coverage is blind to (only with --judge).
+    jq = comparison.get("judge")
+    if jq is not None:
+        jci = jq.get("ci")
+        jci_s = ""
+        if jci is not None:
+            jci_s = f"  [{int(jci['level'] * 100)}% CI {jci['lo']:+.1f}, {jci['hi']:+.1f}]"
+        lines.append(
+            f"judge quality (0-10): {jq['baseline_mean']:.1f} -> {jq['treatment_mean']:.1f}  "
+            f"(change {jq['delta']:+.1f}){jci_s}"
+        )
+
+    lat = comparison.get("latency")
+    if lat is not None:
+        lines.append(
+            f"latency: {lat['baseline_mean_s']:.1f}s -> {lat['treatment_mean_s']:.1f}s  "
+            f"({_fmt_pct(lat['pct_reduction'])})"
+        )
+
+    pw = comparison.get("power")
+    if pw is not None and pw["required_n"] is not None:
+        flag = "UNDERPOWERED" if pw["underpowered"] else "adequately powered"
+        req = pw["required_n"]
+        req_s = "<1" if req < 1 else f"{req:.0f}"
+        lines.append(
+            f"power: observed d={pw['observed_d']:+.2f}, need n≈{req_s}/arm "
+            f"for 80% power at alpha={alpha} -> {flag} (have n={pw['n_per_arm']})"
+        )
+
     lines.append(f"verdict: {verdict}")
+
+    # The v1 headline pairing: every result is (token reduction, quality change). With the
+    # judge on, the triple makes the punchline visible — coverage can hold while the judge drops.
+    out_pct = comparison["deltas"]["output_tokens"]["pct_reduction"]
+    if out_pct is not None and (q is not None or jq is not None):
+        cov_s = f"{q['delta']:+.2f}" if q is not None else "n/a"
+        jud_s = f"{jq['delta']:+.1f}/10" if jq is not None else "n/a"
+        lines.append(
+            f"=> (output-token reduction, coverage change, judge change) = "
+            f"({out_pct:+.1f}%, {cov_s}, {jud_s})"
+        )
 
     lines.append("")
     lines.append("limitations: single task, single machine, n as shown; two-sided Welch's t at")
     lines.append(f"alpha={alpha}. Token counts include cache reads/creation, so cache state across")
-    lines.append("runs is a confound — compare the raw split, not just totals. Directional.")
+    lines.append("runs is a confound — compare the raw split, not just totals. Quality is coverage")
+    lines.append("of the fixture's public API, a completeness proxy only. Directional.")
     return "\n".join(lines)
 
 

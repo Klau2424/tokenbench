@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import sys
 
 from tokenbench import runner
-from tokenbench.experiment import Arm, v0_experiment
+from tokenbench.experiment import Arm, Experiment, v0_experiment
 
 
 def _claude_json(**over):
@@ -111,3 +112,113 @@ def test_reset_fixture_removes_artifact(tmp_path):
     assert not artifact.exists()
     # Idempotent when already clean.
     runner.reset_fixture(tmp_path, "NOTES.md")
+
+
+# --- v1: coverage scoring + replication accumulation ---------------------------------
+
+def test_score_artifact_reads_and_scores(tmp_path):
+    art = tmp_path / "NOTES.md"
+    art.write_text("camelize and pluralize are documented", encoding="utf-8")
+    rec: dict = {}
+    runner.score_artifact(rec, art, ("camelize", "pluralize", "underscore"))
+    assert rec["output_quality"] == 2 / 3
+    assert rec["quality_detail"]["n_mentioned"] == 2
+    assert rec["quality_detail"]["missing"] == ["underscore"]
+
+
+def test_score_artifact_missing_file_sets_none(tmp_path):
+    rec: dict = {}
+    runner.score_artifact(rec, tmp_path / "nope.md", ("camelize",))
+    assert rec["output_quality"] is None
+
+
+def test_score_artifact_no_symbols_sets_none(tmp_path):
+    art = tmp_path / "NOTES.md"
+    art.write_text("anything", encoding="utf-8")
+    rec: dict = {}
+    runner.score_artifact(rec, art, ())
+    assert rec["output_quality"] is None
+
+
+def _mini_experiment(tmp_path, n=1):
+    """A tiny self-contained experiment so run_experiment can be exercised via the stub."""
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    (fixture / "inflection.py").write_text("def camelize(s):\n    return s\n", encoding="utf-8")
+    return Experiment(
+        id="test-exp",
+        fixture_dir=fixture,
+        prompt="do it",
+        model="sonnet",
+        allowed_tools="Read,Write,Edit",
+        arms=[Arm("baseline", None), Arm("terse", "be terse")],
+        n=n,
+        expected_symbols=("camelize",),
+        results_dir=tmp_path / "results",
+    )
+
+
+def test_run_experiment_accumulates_and_tags_batch(tmp_path):
+    exp = _mini_experiment(tmp_path, n=1)
+    stub_cmd = [sys.executable, str(runner.STUB)]
+
+    p1 = runner.run_experiment(exp, base_cmd=stub_cmd, fresh=True)
+    recs1 = [json.loads(line) for line in p1.read_text().splitlines() if line]
+    assert len(recs1) == 2  # one per arm
+    assert all(r["batch_id"] for r in recs1)
+    assert all("output_quality" in r for r in recs1)
+    first_batch = recs1[0]["batch_id"]
+
+    # A second run appends (accumulates) with a distinct batch_id.
+    p2 = runner.run_experiment(exp, base_cmd=stub_cmd, fresh=False)
+    recs2 = [json.loads(line) for line in p2.read_text().splitlines() if line]
+    assert len(recs2) == 4
+    assert recs2[-1]["batch_id"] != first_batch
+
+
+def test_run_experiment_fresh_truncates(tmp_path):
+    exp = _mini_experiment(tmp_path, n=1)
+    stub_cmd = [sys.executable, str(runner.STUB)]
+    runner.run_experiment(exp, base_cmd=stub_cmd, fresh=True)
+    p = runner.run_experiment(exp, base_cmd=stub_cmd, fresh=True)
+    recs = [json.loads(line) for line in p.read_text().splitlines() if line]
+    assert len(recs) == 2  # truncated, not accumulated
+
+
+# --- v1.x: LLM judge ------------------------------------------------------------------
+
+class _FakeJudge:
+    def __init__(self, score):
+        self._score = score
+
+    def score(self, text):
+        return {"judge_quality": self._score / 10, "judge_score": self._score, "judge_reason": "x"}
+
+
+def test_score_judge_attaches_fields():
+    rec: dict = {}
+    runner.score_judge(rec, _FakeJudge(7), "artifact")
+    assert rec["judge_score"] == 7
+    assert rec["judge_quality"] == 0.7
+    assert rec["judge_error"] is None
+
+
+def test_score_judge_is_defensive_on_failure():
+    class Boom:
+        def score(self, t):
+            raise RuntimeError("judge down")
+
+    rec: dict = {}
+    runner.score_judge(rec, Boom(), "artifact")
+    assert rec["judge_score"] is None
+    assert "RuntimeError" in rec["judge_error"]  # recorded, not raised
+
+
+def test_run_experiment_judge_attaches_scores(tmp_path):
+    # Full pipeline through the stub, which answers judge calls for $0.
+    exp = _mini_experiment(tmp_path, n=1)
+    stub_cmd = [sys.executable, str(runner.STUB)]
+    p = runner.run_experiment(exp, base_cmd=stub_cmd, fresh=True, judge=True)
+    recs = [json.loads(line) for line in p.read_text().splitlines() if line]
+    assert all(isinstance(r["judge_score"], (int, float)) for r in recs)
+    assert all("artifact_text" in r for r in recs)

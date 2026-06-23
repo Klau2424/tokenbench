@@ -2,6 +2,9 @@
 .venv/
 .env
 
+# Personal Claude Code config (unattended-run permissions, not for the public repo)
+.claude/settings.local.json
+
 # Python
 __pycache__/
 *.pyc
@@ -12,3 +15,6 @@ dist/
 
 # Task artifacts generated inside fixtures during runs (never commit these)
 fixtures/**/NOTES.md
+
+# Throwaway dry-run output (stub data, never real results)
+results/*-dryrun/

@@ -1,9 +1,12 @@
-"""Declarative definition of the v0 experiment.
+"""Declarative definitions of the experiments tokenbench runs.
 
-One small, fixed, read-and-summarize task on a pinned real repo (the vendored
-``inflection`` module), run N times per arm: a baseline arm and one trivial-rule arm
-("be terse"). Everything except the rule is identical across arms — that is the whole
-methodology.
+Each experiment is one small, fixed task on the pinned ``inflection`` fixture, run N times
+per arm: a baseline arm and one terse-rule arm. Everything except the rule is identical
+across arms — that is the whole methodology.
+
+v1 adds a small **task suite** (``EXPERIMENTS``) spanning objective -> free-form, and pins
+each experiment's ``expected_symbols`` (the fixture's public API, via :mod:`tokenbench.quality`)
+so the runner can score output *coverage* — the quality axis a token cut is judged against.
 """
 
 from __future__ import annotations
@@ -11,7 +14,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import quality
+
 ROOT = Path(__file__).resolve().parents[1]
+FIXTURE_DIR = ROOT / "fixtures" / "inflection"
+FIXTURE_SOURCE = FIXTURE_DIR / "inflection.py"
 
 
 @dataclass(frozen=True)
@@ -31,6 +38,9 @@ class Experiment:
     arms: list[Arm]
     n: int
     artifact: str = "NOTES.md"     # the file the task creates (lives in the per-run temp copy)
+    # Public API symbols of the fixture; the runner scores how many the output still mentions
+    # (coverage = the quality metric). Empty disables scoring.
+    expected_symbols: tuple[str, ...] = ()
     # `--bare` would be the cleanest isolation, but it skips OAuth/keychain auth and only
     # accepts ANTHROPIC_API_KEY. This machine authenticates via subscription/OAuth, so bare
     # can't run here. Instead each run executes in an isolated /tmp copy of the fixture
@@ -43,29 +53,95 @@ class Experiment:
         return self.results_dir / self.id / "runs.jsonl"
 
 
-# The one trivial rule under test. Deliberately blunt: v0 only needs to prove the ruler can
-# detect a difference, not that the rule is clever. A hard word cap forces a large, low-
-# variance gap against an open-ended baseline, which is the cleanest possible demonstration.
-TERSE_RULE = (
+def _prompt(task: str) -> str:
+    return (ROOT / "tasks" / task / "prompt.txt").read_text(encoding="utf-8").strip()
+
+
+def _public_api() -> tuple[str, ...]:
+    """The fixture's public function/class names — the coverage ground truth."""
+    return quality.public_symbols(FIXTURE_SOURCE)
+
+
+# --- treatment rules (the single variable under test, per task) -------------------------
+
+# Free-form task: a blunt word cap. Forces a large, low-variance gap against an open-ended
+# baseline — the cleanest demonstration (this is the v0 Experiment B rule).
+EXPLAIN_TERSE_RULE = (
     "Be maximally concise. Keep the NOTES.md content under 120 words total. "
     "No preamble, no restating the task, no closing remarks, no commentary outside the "
     "file. Telegraphic phrasing; omit filler words."
 )
+# Back-compat alias (older code/tests referenced TERSE_RULE).
+TERSE_RULE = EXPLAIN_TERSE_RULE
+
+# Structured per-function task: trim prose without dropping functions.
+SUMMARIZE_TERSE_RULE = (
+    "Be extremely terse. One short sentence per function, no more. No preamble, no intro, "
+    "no closing remarks, no commentary outside the file. Omit filler words."
+)
+
+# Objective extraction task: keep every name, cut the description to a few words.
+LIST_API_TERSE_RULE = (
+    "Be maximally terse. For each public function output only its name and at most four "
+    "words of description. No preamble, no headings, no extra prose. Still include every "
+    "public function."
+)
 
 
-def v0_experiment() -> Experiment:
-    # Open-ended "explain the module" task: the baseline naturally writes a lot, so the
-    # capped arm has plenty of room to differ -> a clear, reliable separation.
-    prompt = (ROOT / "tasks" / "explain" / "prompt.txt").read_text(encoding="utf-8").strip()
+def _experiment(id: str, task: str, terse_rule: str, n: int = 5) -> Experiment:
     return Experiment(
-        id="v0-explain-cap",
-        fixture_dir=ROOT / "fixtures" / "inflection",
-        prompt=prompt,
+        id=id,
+        fixture_dir=FIXTURE_DIR,
+        prompt=_prompt(task),
         model="sonnet",
         allowed_tools="Read,Write,Edit",
         arms=[
             Arm(name="baseline", append_system_prompt=None),
-            Arm(name="terse", append_system_prompt=TERSE_RULE),
+            Arm(name="terse", append_system_prompt=terse_rule),
         ],
-        n=5,
+        n=n,
+        expected_symbols=_public_api(),
     )
+
+
+# --- the v1 task suite: objective -> free-form ------------------------------------------
+
+def list_api_experiment() -> Experiment:
+    """Objective end: extract every public function (name + one line)."""
+    return _experiment("v1-list-api", "list-api", LIST_API_TERSE_RULE)
+
+
+def summarize_experiment() -> Experiment:
+    """Structured middle: one paragraph per public function."""
+    return _experiment("v1-summarize", "summarize", SUMMARIZE_TERSE_RULE)
+
+
+def explain_experiment() -> Experiment:
+    """Free-form end: open-ended explanation of the module.
+
+    Writes to ``v1-explain`` so the published v0 headline data in
+    ``results/v0-explain-cap/`` is never overwritten (same prompt + rule, now scored for
+    coverage — the quality v0 could not measure).
+    """
+    return _experiment("v1-explain", "explain", EXPLAIN_TERSE_RULE)
+
+
+# Registry: friendly id -> builder. The CLI's --exp selects from these.
+EXPERIMENTS = {
+    "list-api": list_api_experiment,
+    "summarize": summarize_experiment,
+    "explain": explain_experiment,
+}
+
+DEFAULT_EXPERIMENT = "explain"
+
+
+def get_experiment(name: str) -> Experiment:
+    if name not in EXPERIMENTS:
+        raise KeyError(f"unknown experiment {name!r}; choices: {', '.join(EXPERIMENTS)}")
+    return EXPERIMENTS[name]()
+
+
+def v0_experiment() -> Experiment:
+    """Back-compat alias: the original v0 free-form explain experiment."""
+    return explain_experiment()

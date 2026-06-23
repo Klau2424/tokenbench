@@ -85,16 +85,106 @@ Notes:
   almost entirely cached, so **total tokens move little (2.2%)** even when output drops 57%.
   Cost drops 14.8% because output, though a small share of volume, is ~15× the per-token price.
 
+## v1 — quality axis + task suite (2026-06-22)
+
+v1 answers v0's core gap: a token cut is only *good* if quality holds, and v0 measured no
+quality. Added (all stdlib, no new deps):
+
+- **Quality = coverage** (`tokenbench/quality.py`): the fraction of the fixture's public API
+  symbols (extracted from `inflection.py` via `ast`) that the output artifact still mentions.
+  Deterministic and free; it directly measures the completeness a terseness rule tends to
+  sacrifice. A richer LLM-judge scorer is scaffolded but **dormant** (opt-in, token-costing,
+  never invoked by the default flow).
+- **Task suite** spanning objective → free-form: `list-api` (extract every public function),
+  `summarize` (one paragraph each), `explain` (open-ended, the v0 task).
+- **Replication accumulation**: runs append (tagged with a `batch_id`) instead of
+  overwriting; `--fresh` truncates when wanted.
+- **Report upgrades**: every result is now a **(token reduction, quality change)** pair, plus
+  per-arm latency, a power line (`required_n_for_d`, flags UNDERPOWERED), and percentile
+  **bootstrap CIs** for the reduction and the coverage change.
+
+### Real trials — the full task suite (2026-06-23)
+
+The same blunt-terseness treatment arm was run against all three tasks, each at adequate
+power. Data: `results/v1-{list-api,summarize,explain}/runs.jsonl`.
+
+| task (axis) | n/arm | output: baseline → terse | reduction | Welch p | Cohen's d | coverage | verdict |
+|---|---|---|---|---|---|---|---|
+| `list-api` (objective) | 10 | 508 ± 11 → 479 ± 11 | +5.6% | 0.0000 | +2.61 | 1.00 → 1.00 | SEPARATED |
+| `summarize` (structured) | 13 | 1,664 ± 138 → 1,437 ± 131 | +13.7% | 0.0002 | +1.69 | 1.00 → 1.00 | SEPARATED |
+| `explain` (free-form) | 6 | 1,447 ± 113 → 620 ± 26 | +57.2% | 0.0000 | +10.07 | 1.00 → 1.00 | SEPARATED |
+
+Two findings, both of which needed the v1 machinery to see:
+
+**1. The same rule's effect scales with task open-endedness.** Output reduction climbs
+monotonically with how much slack the task leaves: +5.6% (objective) → +13.7% (structured) →
++57.2% (free-form). A terseness instruction can only cut what the task did not pin down. So
+"terse saves 57%!" is a property of the *task*, not the rule — exactly the kind of
+single-number claim the project exists to puncture.
+
+**2. `summarize` confirms the power story.** This is the contrast that *flipped* between two
+n=5 replications in v0 (SEPARATED then NOT). The v1 power line flagged it needed ≈13/arm; at
+n=13 it resolves cleanly to SEPARATED (p=0.0002, d=1.69). Accumulating replications until the
+power readout is satisfied is what turns a coin-flip verdict into a stable one. `list-api`
+made the same point in miniature: NOT SEPARATED at n=3 (p=0.067) → SEPARATED at n=10 (p≈0).
+
+**Coverage held at 1.00 everywhere — and that is itself a result about the metric.** On
+`list-api` it is meaningful: naming every function *is* the deliverable, so +5.6% fewer tokens
+at full coverage is a genuine free saving. On `explain` it is **not** reassuring: a 57% cut
+that still names all 12 functions does not mean quality held — name-coverage cannot see the
+lost *depth* of an open-ended explanation (12 names fit in a sentence). So coverage is a valid
+completeness floor for objective tasks and too coarse for free-form ones. This is precisely
+the gap the **LLM-judge** (next section) is built to fill, and the honest reason v1 does not
+claim "terseness is free" on `explain`.
+
+## v1.x — the LLM judge (2026-06-23)
+
+`tokenbench run --judge` adds a second, opt-in quality scorer: it sends each artifact to a
+Sonnet judge that grades it **0-10 against the actual task** (completeness/accuracy/usefulness,
+explicitly not length). Unlike coverage it can see prose depth. It is off by default (every
+call spends tokens), isolated (judge runs in a clean temp cwd, no project `CLAUDE.md`), and
+failure-tolerant (a bad judge call records an error and leaves the score null rather than
+aborting the batch). Judged runs write to separate `results/v1-*-judged/` dirs so the
+coverage-only data above is untouched.
+
+Each task re-run with the judge on (artifacts also saved to the records for future re-judging):
+
+| task (axis) | n/arm | output reduction | coverage Δ | judge base → terse | judge Δ (95% CI) |
+|---|---|---|---|---|---|
+| `list-api` (objective) | 6 | +10.0% | 0.00 | 7.3 → 8.3 | **+1.0** (−0.5, +2.7) — n.s. |
+| `summarize` (structured) | 8 | +13.5% | 0.00 | 6.4 → 7.0 | **+0.6** (−1.1, +2.4) — n.s. |
+| `explain` (free-form) | 6 | +51.8% | 0.00 | 8.5 → 5.2 | **−3.3** (−4.7, −2.2) — significant |
+
+**The judge sees what coverage cannot — and only where it should.** Coverage reported "no
+quality loss" (Δ=0.00) on all three. The judge **agrees** on the objective and structured
+tasks (its change is small and its CI crosses zero — terseness really is ~free there) but
+**disagrees sharply on free-form** `explain`: a −3.3/10 drop (≈39% relative), CI well clear of
+zero. So the 52% token cut that named every function still produced a materially worse
+explanation — exactly the depth loss name-coverage is blind to. Two scorers agreeing on the
+constrained tasks and diverging on the open-ended one is the cleanest possible demonstration
+of why a free-form quality metric is needed.
+
+Judge caveats: the judge is itself an LLM — one call per artifact, uncalibrated, and noisy
+(hence the wide CIs on the objective/structured tasks). It measures *relative* quality between
+arms, not an absolute grade. Treat the **direction and significance**, not the exact number.
+
 ## Limitations (non-negotiable to state)
 
-Single task per experiment, single machine, single model, n=5. Two-sided Welch's t at α=0.05.
-Exp B is a blunt contrast (proves the ruler, not a subtle technique). Cache state is a confound
-on input/total tokens. Directional, not a general claim.
+Single fixture, single machine, single model; n as shown. Two-sided Welch's t at α=0.05. The
+treatment is a blunt terseness rule, not a subtle technique. **Coverage is a name-mention
+completeness proxy** — it does not judge prose correctness or depth, so it under-detects
+quality loss on free-form tasks (see `explain` above). Token totals are cache-dominated, so
+cache state is a confound on input/total (compare the raw split). Directional, not general.
 
 ## Next
 
-- **v1:** task suite; output-quality metric (a token cut is only "good" if quality holds —
-  Exp B's cap surely costs completeness); latency; variance hardening; a built-in
-  power/required-n check; accumulate replications instead of overwriting.
-- **v2:** the input/context lever — note input here is cache-dominated, so it must be measured
-  in cache-aware terms.
+- **v1 (done):** task suite measured across objective → free-form; coverage + LLM-judge
+  quality metrics; latency; power/required-n; bootstrap CIs; replication accumulation. The
+  coverage/judge pair now characterizes the whole spectrum: terseness is ~free on objective
+  and structured tasks and materially costly on free-form ones.
+- **v1.x polish (optional):** raise judge n past the wide CIs on the objective/structured
+  tasks; multiple judge calls per artifact (or a stronger judge model) to cut judge noise;
+  a `tokenbench judge` subcommand to re-score saved artifacts without re-running tasks (the
+  records now store `artifact_text`, so this is cheap).
+- **v2:** a real reduction technique on the input/context lever — note input here is
+  cache-dominated, so it must be measured in cache-aware terms.

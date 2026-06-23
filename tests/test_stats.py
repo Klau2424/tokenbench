@@ -124,3 +124,75 @@ def test_format_report_smoke():
     assert "verdict:" in text
     assert "limitations:" in text
     assert "SEPARATED" in text
+
+
+# --- v1: required-n, bootstrap CI, quality/latency/power -------------------------------
+
+def _qrec(arm, i, *, out, q, dur=30000, cost=0.01):
+    """A v1-shaped record carrying output_quality and duration_ms."""
+    return {
+        "experiment": "t", "arm": arm, "run_index": i, "valid": True,
+        "input_tokens": 5, "output_tokens": out, "total_tokens": 5 + out,
+        "total_cost_usd": cost, "duration_ms": dur, "output_quality": q,
+    }
+
+
+def test_required_n_for_d_known_values():
+    assert stats.required_n_for_d(None) is None
+    assert stats.required_n_for_d(0) is None
+    assert round(stats.required_n_for_d(1.1)) == 13          # matches RESEARCH.md power note
+    assert stats.required_n_for_d(13.47) < 1                 # huge effect needs <1/arm
+
+
+def test_bootstrap_ci_deterministic_and_brackets():
+    base = [500, 510, 490, 505, 495]
+    treat = [300, 310, 290, 305, 295]
+    ci1 = stats.bootstrap_ci(base, treat, stats._pct_reduction_stat, seed=7)
+    ci2 = stats.bootstrap_ci(base, treat, stats._pct_reduction_stat, seed=7)
+    assert ci1 == ci2                                        # reproducible under a fixed seed
+    assert math.isclose(ci1["point"], 40.0)                 # (500-300)/500
+    assert ci1["lo"] <= ci1["point"] <= ci1["hi"]
+    assert stats.bootstrap_ci([1.0], [2.0, 3.0], stats._pct_reduction_stat) is None
+
+
+def test_compare_arms_quality_latency_power():
+    base = [_qrec("baseline", i, out=o, q=1.0, dur=34000)
+            for i, o in enumerate([1500, 1520, 1490, 1510, 1505])]
+    treat = [_qrec("terse", i, out=o, q=0.7, dur=19000)
+             for i, o in enumerate([640, 650, 645, 655, 648])]
+    cmp = stats.compare_arms(base + treat, "baseline", "terse")
+
+    assert cmp["quality"]["baseline_mean"] == 1.0
+    assert math.isclose(cmp["quality"]["treatment_mean"], 0.7)
+    assert cmp["quality"]["delta"] < 0                       # completeness lost
+    assert cmp["quality"]["ci"] is not None
+    assert cmp["latency"]["pct_reduction"] > 0               # terse arm faster
+    assert cmp["power"]["required_n"] is not None
+    assert cmp["power"]["underpowered"] is False             # d is enormous here
+    assert cmp["primary_ci"]["point"] > 0
+
+
+def test_format_report_quality_pairing():
+    base = [_qrec("baseline", i, out=o, q=1.0) for i, o in enumerate([1500, 1520, 1490])]
+    treat = [_qrec("terse", i, out=o, q=0.7) for i, o in enumerate([640, 650, 645])]
+    text = stats.format_report(stats.compare_arms(base + treat, "baseline", "terse"))
+    assert "quality (coverage)" in text
+    assert "coverage change" in text
+    assert "power:" in text
+
+
+def test_compare_arms_and_report_include_judge():
+    # The punchline case: coverage holds (1.00 both) but the judge drops 9 -> 5.
+    base = [dict(_qrec("baseline", i, out=o, q=1.0), judge_score=9)
+            for i, o in enumerate([1500, 1520, 1490])]
+    treat = [dict(_qrec("terse", i, out=o, q=1.0), judge_score=5)
+             for i, o in enumerate([640, 650, 645])]
+    cmp = stats.compare_arms(base + treat, "baseline", "terse")
+    assert cmp["judge"]["baseline_mean"] == 9
+    assert cmp["judge"]["treatment_mean"] == 5
+    assert cmp["judge"]["delta"] == -4
+    assert cmp["quality"]["delta"] == 0  # coverage blind to the loss the judge caught
+
+    text = stats.format_report(cmp)
+    assert "judge quality (0-10)" in text
+    assert "judge change" in text
