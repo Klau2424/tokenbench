@@ -155,6 +155,7 @@ python -m tokenbench run --dry-run
 python -m tokenbench run                 # default task (explain)
 python -m tokenbench run --exp list-api  # a different task in the v1 suite
 python -m tokenbench run --judge         # also grade each artifact with an LLM judge (more tokens)
+python -m tokenbench judge --exp explain # re-score saved artifacts with an averaged judge (cheap)
 ```
 
 Writes to `results/<experiment>/runs.jsonl`. Each run costs ~$0.10–$0.12. Runs **accumulate**
@@ -173,9 +174,9 @@ python -m tokenbench report --exp explain
 pytest
 ```
 
-44 tests covering stats math (Welch t-test, known critical values, Cohen's d, required-n,
-bootstrap CIs), the coverage and LLM-judge quality scorers, runner parsing, replication
-accumulation, and the judge path (graceful failure, $0 stub).
+48 tests covering stats math (Welch t-test, known critical values, Cohen's d, required-n,
+bootstrap CIs), the coverage and LLM-judge quality scorers (multi-sample averaging, graceful
+failure, $0 stub), runner parsing, replication accumulation, and artifact re-judging.
 
 ---
 
@@ -186,9 +187,9 @@ metric (are the public symbols named?) and an opt-in LLM judge (a 0-10 grade aga
 task) — runs a small task suite (objective → free-form), accumulates replications, and
 reports power and bootstrap CIs. It is still deliberately narrow: one fixture, one model,
 small n, and a blunt terseness rule rather than a subtle technique. Coverage is completeness
-only; the judge is a single uncalibrated LLM call per artifact, so read its direction and
-significance, not its exact number. The thesis stands: build a credible measurement rig
-before measuring any technique.
+only; the judge is an uncalibrated LLM grade (averaged over a few calls), so read its
+direction and significance, not its exact number. The thesis stands: build a credible
+measurement rig before measuring any technique.
 
 See [`RESEARCH.md`](RESEARCH.md) for the full decision log (token capture method, environment
 constraints, every experiment run, honest account of what worked and what didn't) and
@@ -215,12 +216,14 @@ constraints, every experiment run, honest account of what worked and what didn't
   Coverage held throughout — a real free saving on `list-api`, but a known *blind spot* on
   `explain` (name-coverage can't see lost prose depth).
 - **v1.x (built + measured)** — opt-in **LLM judge** (`--judge`) that grades each artifact
-  0-10 against the task, catching the prose depth coverage misses. Run on all three tasks, it
-  **agrees** with coverage that terseness is ~free on the objective and structured tasks
-  (judge change small, CI crosses zero) but catches a **significant −3.3/10 drop** on free-form
-  `explain` — where coverage was blind. Two independent scorers converging on the constrained
-  tasks and diverging on the open-ended one is the cleanest evidence that the 57% cut there
-  *does* cost quality. Full write-up in [`RESEARCH.md`](RESEARCH.md).
+  0-10 against the task, catching the prose depth coverage misses, plus `tokenbench judge
+  --samples N` to average several grades per saved artifact and damp single-call noise. Across
+  all three tasks (3-sample) it **agrees** with coverage that terseness is ~free on the
+  objective and structured tasks (judge change small, CI crosses zero) but catches a
+  **significant −3.0/10 drop** on free-form `explain` — where coverage was blind, and the drop
+  survives averaging. Two independent scorers converging on the constrained tasks and diverging
+  on the open-ended one is the cleanest evidence that the 52% cut there *does* cost quality.
+  Full write-up in [`RESEARCH.md`](RESEARCH.md).
 - **v2 (intent)** — a real reduction technique, targeting the input/context lever (what loads
   and re-injects each turn). The output-terseness lever is already owned by existing tools;
   the input side is less explored and cache-dominated in ways that need careful measurement.

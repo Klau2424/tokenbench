@@ -5,10 +5,10 @@ fraction of the fixture's known public API symbols that the run's output artifac
 mentions. This is deterministic, dependency-free ($0), and directly captures the
 completeness a terseness rule tends to sacrifice — exactly the v0 limitation it answers.
 
-A richer LLM-judge scorer is scaffolded (``JudgeScorer`` / ``build_judge_command``) but is
-**DORMANT**: each judge call spends tokens, which works against this project's whole
-premise, so the default run path never invokes it. It is opt-in only, and ``score`` refuses
-to run without an explicit runner so tokens can never be spent silently.
+A richer ``JudgeScorer`` grades the artifact 0-10 against the task with an LLM, catching the
+prose-depth loss coverage is blind to. It is **opt-in** (each call spends tokens) and
+``score`` refuses to run without an explicit runner, so tokens are never spent silently. It
+can average several samples per artifact to damp the noise of a single LLM grade.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import statistics
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -126,8 +127,13 @@ class JudgeScorer:
     """Task-aware LLM-judge quality scorer — opt-in and token-costing.
 
     ``score`` requires an explicit ``runner`` callable (``cmd -> stdout``); with no runner it
-    raises rather than silently spending tokens. Only ``tokenbench run --judge`` wires a live
-    runner. Returns a 0-1 ``judge_quality`` (score/10) plus the raw 0-10 score and reason.
+    raises rather than silently spending tokens. Only ``tokenbench run --judge`` / ``judge``
+    wires a live runner.
+
+    With ``samples > 1`` it grades the same artifact several times and averages — one LLM
+    grade is noisy, so the per-artifact mean is a steadier number. Returns a 0-1
+    ``judge_quality`` (mean/10), the mean 0-10 ``judge_score``, the raw ``judge_scores`` list,
+    their ``judge_score_sd``, and how many samples actually succeeded (``judge_n``).
     """
 
     def __init__(
@@ -136,11 +142,21 @@ class JudgeScorer:
         runner: Callable[[list[str]], str] | None = None,
         base_cmd: tuple[str, ...] = ("claude",),
         model: str = JUDGE_MODEL,
+        samples: int = 1,
     ):
         self.task_prompt = task_prompt
         self.runner = runner
         self.base_cmd = base_cmd
         self.model = model
+        self.samples = max(1, samples)
+
+    def _one_score(self, cmd: list[str]) -> tuple[float, str | None]:
+        data = json.loads(self.runner(cmd))
+        inner = data.get("result", data) if isinstance(data, dict) else data
+        if isinstance(inner, str):
+            inner = _extract_score_json(inner)
+        raw = max(0.0, min(10.0, float(inner["score"])))
+        return raw, inner.get("reason")
 
     def score(self, artifact_text: str) -> dict:
         if self.runner is None:
@@ -148,14 +164,24 @@ class JudgeScorer:
                 "JudgeScorer needs an explicit runner to spend tokens on judging."
             )
         cmd = build_judge_command(artifact_text, self.task_prompt, self.base_cmd, self.model)
-        data = json.loads(self.runner(cmd))
-        inner = data.get("result", data) if isinstance(data, dict) else data
-        if isinstance(inner, str):
-            inner = _extract_score_json(inner)
-        raw_score = float(inner["score"])
-        raw_score = max(0.0, min(10.0, raw_score))
+        scores: list[float] = []
+        reasons: list[str | None] = []
+        last_err: Exception | None = None
+        for _ in range(self.samples):
+            try:
+                s, reason = self._one_score(cmd)
+                scores.append(s)
+                reasons.append(reason)
+            except Exception as e:  # noqa: BLE001 - tolerate a flaky sample; need only one
+                last_err = e
+        if not scores:
+            raise RuntimeError(f"all {self.samples} judge sample(s) failed: {last_err}")
+        mean = statistics.mean(scores)
         return {
-            "judge_quality": raw_score / 10.0,
-            "judge_score": raw_score,
-            "judge_reason": inner.get("reason"),
+            "judge_quality": mean / 10.0,
+            "judge_score": mean,
+            "judge_scores": scores,
+            "judge_score_sd": statistics.stdev(scores) if len(scores) >= 2 else 0.0,
+            "judge_n": len(scores),
+            "judge_reason": reasons[-1],
         }

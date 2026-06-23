@@ -81,3 +81,32 @@ def test_build_judge_command_is_task_aware():
     assert "--output-format" in cmd and "json" in cmd
     assert any(quality.JUDGE_MARKER in part for part in cmd)
     assert any("explain the module" in part for part in cmd)
+
+
+def test_judge_averages_multiple_samples():
+    seq = iter([6, 8, 10])
+
+    def runner_fn(cmd):
+        return json.dumps({"result": json.dumps({"score": next(seq)})})
+
+    out = quality.JudgeScorer("task", runner=runner_fn, samples=3).score("artifact")
+    assert out["judge_n"] == 3
+    assert out["judge_scores"] == [6, 8, 10]
+    assert out["judge_score"] == 8          # mean
+    assert out["judge_score_sd"] > 0        # real spread captured
+
+
+def test_judge_tolerates_some_failed_samples():
+    seq = iter([
+        json.dumps({"result": json.dumps({"score": 7})}),
+        "not json at all",                  # this sample fails to parse
+        json.dumps({"result": json.dumps({"score": 9})}),
+    ])
+    out = quality.JudgeScorer("task", runner=lambda cmd: next(seq), samples=3).score("a")
+    assert out["judge_n"] == 2              # one sample dropped, not fatal
+    assert out["judge_score"] == 8          # mean of the two that worked
+
+
+def test_judge_raises_when_all_samples_fail():
+    with pytest.raises(RuntimeError):
+        quality.JudgeScorer("task", runner=lambda cmd: "garbage", samples=2).score("a")

@@ -192,10 +192,7 @@ def score_judge(rec: dict, judge_scorer, artifact_text: str) -> None:
     rec["judge_reason"] = None
     rec["judge_error"] = None
     try:
-        out = judge_scorer.score(artifact_text)
-        rec["judge_quality"] = out["judge_quality"]
-        rec["judge_score"] = out["judge_score"]
-        rec["judge_reason"] = out["judge_reason"]
+        rec.update(judge_scorer.score(artifact_text))  # judge_quality/score/scores/sd/n/reason
     except Exception as e:  # noqa: BLE001 - a judge call must never abort a run
         rec["judge_error"] = f"{type(e).__name__}: {e}"[:200]
 
@@ -249,11 +246,12 @@ def run_once(exp: Experiment, arm: Arm, run_index: int, base_cmd: list[str],
     return rec
 
 
-def _build_judge(exp: Experiment, base_cmd: list[str]):
+def _build_judge(exp: Experiment, base_cmd: list[str], samples: int = 1):
     """An isolated, time-bounded JudgeScorer that grades each artifact against the task.
 
     The judge subprocess runs in a fresh temp cwd (no project ``CLAUDE.md`` to bias it) using
-    the same binary as the task (real ``claude``, or the stub for dry runs)."""
+    the same binary as the task (real ``claude``, or the stub for dry runs). ``samples`` LLM
+    grades per artifact are averaged to damp single-call noise."""
     def _judge_run(cmd: list[str]) -> str:
         d = Path(tempfile.mkdtemp(prefix="tokenbench-judge-"))
         try:
@@ -262,11 +260,52 @@ def _build_judge(exp: Experiment, base_cmd: list[str]):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
-    return quality.JudgeScorer(exp.prompt, runner=_judge_run, base_cmd=tuple(base_cmd))
+    return quality.JudgeScorer(exp.prompt, runner=_judge_run, base_cmd=tuple(base_cmd),
+                               samples=samples)
+
+
+def rejudge(exp: Experiment, base_cmd: list[str] | None = None, samples: int = 3,
+            dry_run: bool = False) -> Path:
+    """Re-score the saved artifacts in ``exp``'s ``runs.jsonl`` with an averaged judge.
+
+    Because each record stores its ``artifact_text``, this spends judge tokens only — no task
+    re-runs — so it is the cheap way to tighten noisy judge numbers after the fact. Only
+    judge_* fields are rewritten; tokens/coverage/timing are left untouched.
+    """
+    if base_cmd is None:
+        base_cmd = [sys.executable, str(STUB)] if dry_run else ["claude"]
+    judge_scorer = _build_judge(exp, base_cmd, samples=samples)
+
+    path = exp.runs_file()
+    records: list[dict] = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+
+    scored = 0
+    for rec in records:
+        if rec.get("valid") and rec.get("artifact_text"):
+            score_judge(rec, judge_scorer, rec["artifact_text"])
+            scored += 1
+            print(
+                f"[judge] {rec.get('arm', '?'):<9} run {rec.get('run_index')}  "
+                f"score={rec.get('judge_score')} (n={rec.get('judge_n')}, "
+                f"sd={rec.get('judge_score_sd')})",
+                flush=True,
+            )
+
+    with open(path, "w", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec) + "\n")
+    print(f"re-judged {scored} artifacts @ {samples} samples -> {path}", flush=True)
+    return path
 
 
 def run_experiment(exp: Experiment, base_cmd: list[str] | None = None,
-                   dry_run: bool = False, fresh: bool = False, judge: bool = False) -> Path:
+                   dry_run: bool = False, fresh: bool = False, judge: bool = False,
+                   judge_samples: int = 1) -> Path:
     """Run all arms, interleaved, appending each record to ``runs.jsonl`` as it completes.
 
     Interleaving (round-robin over arms within each repetition) spreads any time-correlated
@@ -280,7 +319,7 @@ def run_experiment(exp: Experiment, base_cmd: list[str] | None = None,
     if base_cmd is None:
         base_cmd = [sys.executable, str(STUB)] if dry_run else ["claude"]
 
-    judge_scorer = _build_judge(exp, base_cmd) if judge else None
+    judge_scorer = _build_judge(exp, base_cmd, samples=judge_samples) if judge else None
 
     runs_path = exp.runs_file()
     runs_path.parent.mkdir(parents=True, exist_ok=True)

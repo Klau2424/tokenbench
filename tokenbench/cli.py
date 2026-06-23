@@ -9,7 +9,7 @@ from dataclasses import replace
 
 from . import stats
 from .experiment import DEFAULT_EXPERIMENT, EXPERIMENTS, get_experiment
-from .runner import run_experiment
+from .runner import rejudge, run_experiment
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -27,8 +27,25 @@ def _cmd_run(args: argparse.Namespace) -> int:
         mode += " + LLM JUDGE (extra token spend per run)"
     accum = "fresh file" if args.fresh else "appending (accumulate replications)"
     print(f"== tokenbench {exp.id} : {mode} : {exp.n} per arm : {accum} ==")
-    runs_path = run_experiment(exp, dry_run=args.dry_run, fresh=args.fresh, judge=args.judge)
+    runs_path = run_experiment(exp, dry_run=args.dry_run, fresh=args.fresh, judge=args.judge,
+                               judge_samples=args.judge_samples)
     print(f"\nwrote {runs_path}\n")
+    print(stats.report_from_file(runs_path, "baseline", "terse"))
+    return 0
+
+
+def _cmd_judge(args: argparse.Namespace) -> int:
+    # Re-score already-saved artifacts (the run used --judge, so artifact_text is stored).
+    # Spends judge tokens only — no task re-runs — to tighten noisy judge numbers.
+    exp = replace(get_experiment(args.exp), id=get_experiment(args.exp).id + "-judged")
+    runs_path = exp.runs_file()
+    if not runs_path.exists():
+        print(f"no judged runs at {runs_path}; run "
+              f"`python -m tokenbench run --judge --exp {args.exp}` first", file=sys.stderr)
+        return 1
+    print(f"== re-judging {exp.id} @ {args.samples} samples/artifact (judge tokens only) ==")
+    rejudge(exp, samples=args.samples)
+    print()
     print(stats.report_from_file(runs_path, "baseline", "terse"))
     return 0
 
@@ -57,7 +74,16 @@ def main(argv: list[str] | None = None) -> int:
                        help="truncate runs.jsonl first instead of accumulating replications")
     p_run.add_argument("--judge", action="store_true",
                        help="also score each artifact with an LLM judge (spends extra tokens)")
+    p_run.add_argument("--judge-samples", type=int, default=3,
+                       help="LLM grades per artifact to average when --judge (default 3)")
     p_run.set_defaults(func=_cmd_run)
+
+    p_judge = sub.add_parser("judge", help="re-score saved artifacts with an averaged LLM judge")
+    p_judge.add_argument("--exp", choices=choices, default=DEFAULT_EXPERIMENT,
+                         help=f"which experiment's judged runs to re-score (default: {DEFAULT_EXPERIMENT})")
+    p_judge.add_argument("--samples", type=int, default=3,
+                         help="LLM grades per artifact to average (default 3)")
+    p_judge.set_defaults(func=_cmd_judge)
 
     p_report = sub.add_parser("report", help="re-print the report from saved runs")
     p_report.add_argument("--exp", choices=choices, default=DEFAULT_EXPERIMENT,

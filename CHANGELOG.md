@@ -62,23 +62,31 @@ $0 (stdlib + dry-run stub + pytest); a single small real trial produces the v1 d
 ## v1.x — LLM judge (2026-06-23)
 
 Activated the (previously dormant) LLM-judge: `tokenbench run --judge` grades each artifact
-0-10 against the actual task via a Sonnet subprocess. Now task-aware, isolated (clean temp
-cwd), failure-tolerant (a bad judge call records an error, never aborts the batch), and
-$0-testable (the dry-run stub answers judge calls). Runs save `artifact_text` for future
-re-judging; judged data lands in separate `results/v1-*-judged/` dirs (v1 data untouched).
-Report now prints a **(token reduction, coverage Δ, judge Δ)** triple. +6 tests (now 44).
+0-10 against the actual task via a Sonnet subprocess. Task-aware, isolated (clean temp cwd),
+failure-tolerant (a bad judge call records an error, never aborts the batch), and $0-testable
+(the dry-run stub answers judge calls). Runs save `artifact_text`; judged data lands in
+separate `results/v1-*-judged/` dirs (v1 data untouched). Report prints a **(token reduction,
+coverage Δ, judge Δ)** triple.
 
-- Real judged runs (data in `results/v1-{list-api,summarize,explain}-judged/`):
+De-noise pass: the judge can average **N grades per artifact** (`--judge-samples`), and
+`tokenbench judge --samples N` re-scores already-saved artifacts (judge tokens only, no task
+re-runs). Numbers below are **3-sample** and supersede the single-call first pass. +10 tests
+total (now 48).
+
+- Judged runs, 3-sample (data in `results/v1-{list-api,summarize,explain}-judged/`):
 
   | task | n/arm | output cut | coverage Δ | judge base→terse | judge Δ (95% CI) |
   |---|---|---|---|---|---|
-  | `list-api` (objective) | 6 | +10.0% | 0.00 | 7.3→8.3 | +1.0 (−0.5,+2.7) n.s. |
-  | `summarize` (structured) | 8 | +13.5% | 0.00 | 6.4→7.0 | +0.6 (−1.1,+2.4) n.s. |
-  | `explain` (free-form) | 6 | +51.8% | 0.00 | 8.5→5.2 | **−3.3 (−4.7,−2.2) sig** |
+  | `list-api` (objective) | 6 | +10.0% | 0.00 | 6.2→6.2 | +0.0 (−2.0,+2.0) n.s. |
+  | `summarize` (structured) | 8 | +13.5% | 0.00 | 7.1→7.8 | +0.6 (−0.5,+1.8) n.s. |
+  | `explain` (free-form) | 6 | +51.8% | 0.00 | 8.8→5.8 | **−3.0 (−4.2,−1.7) sig** |
 
 - Punchline: coverage said "no quality loss" on all three; the judge **agreed** on the
-  objective/structured tasks (CI crosses 0) but caught a **significant −3.3/10 drop** on
-  free-form `explain` — the prose-depth loss name-coverage is blind to. Two scorers agreeing
-  where the task is constrained and diverging where it is open-ended is the cleanest
-  demonstration of why a free-form quality metric is needed. (Judge is one LLM call/artifact,
-  uncalibrated and noisy — read direction + significance, not the exact number.)
+  objective/structured tasks (CI crosses 0) but caught a **significant −3.0/10 drop** on
+  free-form `explain` — the prose-depth loss name-coverage is blind to.
+- De-noise effect (1× → 3×): corrected point estimates without flipping any verdict —
+  `list-api` +1.0 → +0.0 (the apparent "terse better" was noise), `summarize` held +0.6 with a
+  tighter CI, `explain` held its significant drop (−3.3 → −3.0). Lesson: averaging fixes the
+  point estimate, but at n=6–8 artifacts the CI width is bound by task-run count, not
+  judge-call noise — so `list-api`'s interval did not shrink. (Judge is now a 3-call mean,
+  still uncalibrated and small-n — read direction + significance, not the exact number.)

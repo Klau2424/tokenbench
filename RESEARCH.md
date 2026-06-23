@@ -147,26 +147,37 @@ failure-tolerant (a bad judge call records an error and leaves the score null ra
 aborting the batch). Judged runs write to separate `results/v1-*-judged/` dirs so the
 coverage-only data above is untouched.
 
-Each task re-run with the judge on (artifacts also saved to the records for future re-judging):
+Each task was run with the judge on (artifacts are saved to the records), then re-scored with
+`tokenbench judge --samples 3`, which averages 3 LLM grades per artifact to damp single-call
+noise (judge tokens only, no task re-runs). Numbers below are the **3-sample** values:
 
 | task (axis) | n/arm | output reduction | coverage Δ | judge base → terse | judge Δ (95% CI) |
 |---|---|---|---|---|---|
-| `list-api` (objective) | 6 | +10.0% | 0.00 | 7.3 → 8.3 | **+1.0** (−0.5, +2.7) — n.s. |
-| `summarize` (structured) | 8 | +13.5% | 0.00 | 6.4 → 7.0 | **+0.6** (−1.1, +2.4) — n.s. |
-| `explain` (free-form) | 6 | +51.8% | 0.00 | 8.5 → 5.2 | **−3.3** (−4.7, −2.2) — significant |
+| `list-api` (objective) | 6 | +10.0% | 0.00 | 6.2 → 6.2 | **+0.0** (−2.0, +2.0) — n.s. |
+| `summarize` (structured) | 8 | +13.5% | 0.00 | 7.1 → 7.8 | **+0.6** (−0.5, +1.8) — n.s. |
+| `explain` (free-form) | 6 | +51.8% | 0.00 | 8.8 → 5.8 | **−3.0** (−4.2, −1.7) — significant |
 
 **The judge sees what coverage cannot — and only where it should.** Coverage reported "no
 quality loss" (Δ=0.00) on all three. The judge **agrees** on the objective and structured
 tasks (its change is small and its CI crosses zero — terseness really is ~free there) but
-**disagrees sharply on free-form** `explain`: a −3.3/10 drop (≈39% relative), CI well clear of
+**disagrees sharply on free-form** `explain`: a −3.0/10 drop (≈34% relative), CI well clear of
 zero. So the 52% token cut that named every function still produced a materially worse
 explanation — exactly the depth loss name-coverage is blind to. Two scorers agreeing on the
 constrained tasks and diverging on the open-ended one is the cleanest possible demonstration
 of why a free-form quality metric is needed.
 
-Judge caveats: the judge is itself an LLM — one call per artifact, uncalibrated, and noisy
-(hence the wide CIs on the objective/structured tasks). It measures *relative* quality between
-arms, not an absolute grade. Treat the **direction and significance**, not the exact number.
+**What the 3-sample de-noise changed (1× → 3×).** Averaging corrected point estimates without
+overturning any verdict: `list-api` moved +1.0 → +0.0 (the apparent "terse better" was
+single-call noise), `summarize` held at +0.6 with a tighter CI (−1.1,+2.4 → −0.5,+1.8), and
+`explain` held its significant drop (−3.3 → −3.0, CI still clear of zero). The free-form loss
+is therefore robust, not a grading fluke. A useful lesson: averaging fixes the *point
+estimate*, but at n=6–8 artifacts the CI width is bound by the **number of task runs**, not by
+single-call judge noise — so `list-api`'s interval did not shrink. Narrowing it further needs
+more artifacts (task re-runs), not more judge samples.
+
+Judge caveats: the judge is itself an LLM — now a mean of 3 calls per artifact, but still
+uncalibrated and small-n. It measures *relative* quality between arms, not an absolute grade.
+Treat the **direction and significance**, not the exact number.
 
 ## Limitations (non-negotiable to state)
 
@@ -182,9 +193,10 @@ cache state is a confound on input/total (compare the raw split). Directional, n
   quality metrics; latency; power/required-n; bootstrap CIs; replication accumulation. The
   coverage/judge pair now characterizes the whole spectrum: terseness is ~free on objective
   and structured tasks and materially costly on free-form ones.
-- **v1.x polish (optional):** raise judge n past the wide CIs on the objective/structured
-  tasks; multiple judge calls per artifact (or a stronger judge model) to cut judge noise;
-  a `tokenbench judge` subcommand to re-score saved artifacts without re-running tasks (the
-  records now store `artifact_text`, so this is cheap).
+- **v1.x polish (done):** `tokenbench judge --samples N` re-scores saved artifacts with an
+  averaged judge (judge tokens only). 3-sample averaging cleaned up the point estimates and
+  confirmed the `explain` drop is robust. Remaining knob: the judge CIs are now bound by the
+  small **artifact count** (n=6–8), so the cheap-but-noisy lever is exhausted — tightening
+  further means more task runs (or a stronger/calibrated judge model), not more samples.
 - **v2:** a real reduction technique on the input/context lever — note input here is
   cache-dominated, so it must be measured in cache-aware terms.

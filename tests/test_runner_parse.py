@@ -218,7 +218,31 @@ def test_run_experiment_judge_attaches_scores(tmp_path):
     # Full pipeline through the stub, which answers judge calls for $0.
     exp = _mini_experiment(tmp_path, n=1)
     stub_cmd = [sys.executable, str(runner.STUB)]
-    p = runner.run_experiment(exp, base_cmd=stub_cmd, fresh=True, judge=True)
+    p = runner.run_experiment(exp, base_cmd=stub_cmd, fresh=True, judge=True, judge_samples=2)
     recs = [json.loads(line) for line in p.read_text().splitlines() if line]
     assert all(isinstance(r["judge_score"], (int, float)) for r in recs)
+    assert all(r["judge_n"] == 2 for r in recs)         # averaged two samples
     assert all("artifact_text" in r for r in recs)
+
+
+def test_rejudge_rescores_only_saved_valid_artifacts(tmp_path):
+    exp = _mini_experiment(tmp_path, n=1)
+    path = exp.runs_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    recs = [
+        {"valid": True, "arm": "baseline", "run_index": 0,
+         "artifact_text": "## camelize\n## pluralize\n"},
+        {"valid": True, "arm": "terse", "run_index": 0, "artifact_text": "## camelize\n"},
+        {"valid": False, "arm": "baseline", "run_index": 1, "artifact_text": None},  # skipped
+    ]
+    path.write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
+
+    stub_cmd = [sys.executable, str(runner.STUB)]
+    runner.rejudge(exp, base_cmd=stub_cmd, samples=2)
+
+    out = [json.loads(line) for line in path.read_text().splitlines() if line]
+    assert isinstance(out[0]["judge_score"], (int, float)) and out[0]["judge_n"] == 2
+    assert len(out[0]["judge_scores"]) == 2
+    assert out[2].get("judge_score") is None            # invalid / no-artifact row left alone
+    # Token/coverage fields are never touched by rejudge (none here to begin with).
+    assert "output_tokens" not in out[0]
