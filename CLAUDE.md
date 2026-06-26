@@ -25,8 +25,9 @@ Build the minimal A/B rig:
 
 1. **v0** — A/B rig detects a token difference on a dumb baseline rule. ✅ met: clean separation (output −57%, d=13.5, p≈0) on a strong contrast; it also correctly flags a too-subtle contrast as not-detectable at n=5. ← v1 next. See [RESEARCH.md](RESEARCH.md).
 2. **v1** — expand to a small task suite; add cost, latency, and output-quality metrics; harden variance handling.
-3. **v2** — develop and measure a real reduction technique. Favor the **input/context** lever (what loads + re-injects each turn) — less crowded than the output-terseness lever already owned by existing tools.
-4. **v3** — package the proven technique as a Claude Code skill/plugin.
+3. **v2** — the **input/context** lever, *lean standing context* (verbose vs lean `CLAUDE.md`), judged cache-aware on `input_cost_usd`. ✅ measured on real tokens: trimming filler is −6.7% cost but loses quality (filler bought quality); trimming the prescriptive convention costs *more* via output sprawl — and a length-robust **pairwise** re-judge shows that longer output is genuinely preferred, so the convention traded quality for cost-discipline. "Shrink your `CLAUDE.md`, it's free" is false both ways. See [RESEARCH.md](RESEARCH.md).
+4. **v2.5** — token-efficiency pass. ✅ A task run is ~98% cache / unshrinkable (OAuth blocks `--bare`), so the lever is the **judge**: instrumenting its previously-discarded spend revealed each call costs ~$0.063 and pays a **cold cache** (~3× a task run). Adaptive sampling cuts judge calls ~48% (cost screen; `pairwise` is precision). Added `tokenbench budget` + an opt-in `--confirm-spend`-gated 3-arm `context-decompose`. **Next, unbuilt:** warm the judge cache. See [RESEARCH.md](RESEARCH.md).
+5. **v3** — package a proven technique as a Claude Code skill/plugin (do NOT ship until it provides real value; v2 hints it's "keep a tight convention," not "make the context short").
 
 ## Hard rules (non-negotiable — this IS the methodology)
 

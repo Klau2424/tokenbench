@@ -53,6 +53,31 @@ def _emit_judge(argv, rng) -> int:
     return 0
 
 
+def _emit_pairwise(argv, rng) -> int:
+    """Answer a pairwise judge call ($0): pick the answer with more '## symbol' sections as the
+    winner (a quality proxy), tie when equal. Exercises the blind-pairwise path without tokens."""
+    try:
+        prompt = argv[argv.index("-p") + 1]
+    except (ValueError, IndexError):
+        prompt = ""
+    a = prompt.split("ANSWER A:", 1)[-1].split("ANSWER B:", 1)[0]
+    b = prompt.split("ANSWER B:", 1)[-1]
+    na, nb = a.count("## "), b.count("## ")
+    winner = "A" if na > nb else "B" if nb > na else "tie"
+    inner = json.dumps({"winner": winner, "reason": "stub pairwise: more sections wins"})
+    result = {
+        "type": "result", "subtype": "success", "is_error": False, "num_turns": 1,
+        "duration_ms": 800 + rng.randint(-100, 100),
+        "session_id": f"stub-pairwise-{os.getpid()}",
+        "result": inner, "total_cost_usd": 0.001,
+        "usage": {"input_tokens": 90, "output_tokens": 15,
+                  "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+        "modelUsage": {"claude-sonnet-4-6": {"inputTokens": 90}},
+    }
+    print(json.dumps(result))
+    return 0
+
+
 def main() -> int:
     argv = sys.argv[1:]
     is_treatment = "--append-system-prompt" in argv
@@ -60,23 +85,37 @@ def main() -> int:
     # Deterministic-ish jitter keyed to PID so repeated dry runs vary a little.
     rng = random.Random(os.getpid())
 
+    # Pairwise judge calls carry their own marker (and don't contain the absolute-judge marker),
+    # so check them first.
+    joined = " ".join(argv)
+    if "TOKENBENCH-PAIRWISE" in joined:
+        return _emit_pairwise(argv, rng)
     # Judge calls carry the judge marker in their -p prompt; answer them and stop.
-    if "TOKENBENCH-JUDGE" in " ".join(argv):
+    if "TOKENBENCH-JUDGE" in joined:
         return _emit_judge(argv, rng)
 
     # Baseline writes a verbose NOTES.md; terse writes a shorter one.
     base_output = 1400 if not is_treatment else 600
     output_tokens = base_output + rng.randint(-60, 60)
     input_tokens = 9000 + rng.randint(-200, 200)
-    cache_read = 12000 + rng.randint(-300, 300)
-    cache_creation = 4000 + rng.randint(-100, 100)
+
+    # v2 input/context lever: a CLAUDE.md auto-loaded into cwd is cached, so its size drives the
+    # cache split. Bigger standing context -> more cache_creation (cold) + cache_read (re-injected
+    # per turn). Approx ~4 chars/token. This makes the dry run separable on input cost at $0.
+    ctx_tokens = 0
+    try:
+        ctx_tokens = len(open("CLAUDE.md", encoding="utf-8").read()) // 4
+    except OSError:
+        pass
+    cache_read = 12000 + ctx_tokens * 3 + rng.randint(-300, 300)   # re-injected across ~3 turns
+    cache_creation = 4000 + ctx_tokens + rng.randint(-100, 100)    # written once on cold load
 
     # Rough Sonnet-ish blended cost just so the field is populated in dry runs.
     cost = (
         input_tokens * 3e-6
         + output_tokens * 15e-6
         + cache_read * 0.3e-6
-        + cache_creation * 3.75e-6
+        + cache_creation * 6e-6   # 1-hour cache write (2x base input), matching real Claude Code
     )
 
     # Write a faithful NOTES.md: the baseline arm documents every public symbol (full

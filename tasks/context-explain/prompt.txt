@@ -1,0 +1,1 @@
+Read inflection.py in this directory. Then, following this project's documented conventions for NOTES files (see the project context), write an explanation of the module to a new file named NOTES.md.

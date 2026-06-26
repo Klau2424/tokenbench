@@ -23,9 +23,15 @@ FIXTURE_SOURCE = FIXTURE_DIR / "inflection.py"
 
 @dataclass(frozen=True)
 class Arm:
-    """One experimental condition. ``append_system_prompt=None`` is the baseline."""
+    """One experimental condition. ``append_system_prompt=None`` is the baseline.
+
+    ``context`` is the v2 input/context lever: literal text the runner writes as ``CLAUDE.md``
+    into the run's isolated cwd, so Claude Code auto-loads (and re-injects) it every turn. The
+    verbose/lean variants of this file are the single variable a v2 experiment changes.
+    """
     name: str
     append_system_prompt: str | None = None
+    context: str | None = None
 
 
 @dataclass(frozen=True)
@@ -37,6 +43,10 @@ class Experiment:
     allowed_tools: str
     arms: list[Arm]
     n: int
+    # The metric the separation test (Welch t / Cohen's d / CI) judges the arms on. v1 levers
+    # move output, so it defaults to output_tokens; v2's input/context lever sets this to the
+    # cache-aware "input_cost_usd" so separation is judged on the side the technique actually moves.
+    primary_metric: str = "output_tokens"
     artifact: str = "NOTES.md"     # the file the task creates (lives in the per-run temp copy)
     # Public API symbols of the fixture; the runner scores how many the output still mentions
     # (coverage = the quality metric). Empty disables scoring.
@@ -57,6 +67,11 @@ def _prompt(task: str) -> str:
     return (ROOT / "tasks" / task / "prompt.txt").read_text(encoding="utf-8").strip()
 
 
+def _context(name: str) -> str:
+    """Load a standing-context doc from ``contexts/`` (the v2 verbose/lean CLAUDE.md variants)."""
+    return (ROOT / "contexts" / f"{name}.md").read_text(encoding="utf-8")
+
+
 def _public_api() -> tuple[str, ...]:
     """The fixture's public function/class names — the coverage ground truth."""
     return quality.public_symbols(FIXTURE_SOURCE)
@@ -71,8 +86,6 @@ EXPLAIN_TERSE_RULE = (
     "No preamble, no restating the task, no closing remarks, no commentary outside the "
     "file. Telegraphic phrasing; omit filler words."
 )
-# Back-compat alias (older code/tests referenced TERSE_RULE).
-TERSE_RULE = EXPLAIN_TERSE_RULE
 
 # Structured per-function task: trim prose without dropping functions.
 SUMMARIZE_TERSE_RULE = (
@@ -126,11 +139,96 @@ def explain_experiment() -> Experiment:
     return _experiment("v1-explain", "explain", EXPLAIN_TERSE_RULE)
 
 
+# --- the v2 input/context lever: verbose vs lean standing context -----------------------
+
+def context_lean_experiment() -> Experiment:
+    """v2: same task, two standing-context files (``CLAUDE.md``) — verbose vs lean.
+
+    The only variable is the context the runner writes into each run's cwd, which Claude Code
+    auto-loads and re-injects every turn. Separation is judged on the cache-aware
+    ``input_cost_usd`` (the side this lever moves), not output tokens. v2.0 is the *free trim*
+    case: the verbose arm is filler-heavy, so trimming should cut input cost with quality held.
+    """
+    return Experiment(
+        id="v2-context-lean",
+        fixture_dir=FIXTURE_DIR,
+        prompt=_prompt("context-explain"),
+        model="sonnet",
+        allowed_tools="Read,Write,Edit",
+        arms=[
+            Arm(name="verbose", context=_context("verbose")),  # baseline: heavy standing context
+            Arm(name="lean", context=_context("lean")),        # treatment: short + link out
+        ],
+        n=5,
+        primary_metric="input_cost_usd",
+        expected_symbols=_public_api(),
+    )
+
+
+def context_costly_experiment() -> Experiment:
+    """v2.1: the *costly-trim* counterpart to ``context-lean``.
+
+    Same verbose baseline (``verbose.md``, which carries the load-bearing NOTES convention), but
+    the lean arm here (``lean-costly.md``) drops that convention entirely — not just the filler.
+    So this trims *load-bearing* context, where ``context-lean`` trimmed only filler. The
+    free-vs-costly contrast across the two experiments isolates the convention's value: quality is
+    expected to hold for the free trim and fall for this one — the input-lever mirror of v1's
+    ``list-api`` (free) vs ``explain`` (costly). The judge is the quality signal to watch (name
+    coverage may stay 1.00, as it did on v1 ``explain`` — that blindness is itself the point).
+    """
+    return Experiment(
+        id="v2-context-costly",
+        fixture_dir=FIXTURE_DIR,
+        prompt=_prompt("context-explain"),
+        model="sonnet",
+        allowed_tools="Read,Write,Edit",
+        arms=[
+            Arm(name="verbose", context=_context("verbose")),       # keeps the NOTES convention
+            Arm(name="lean", context=_context("lean-costly")),      # drops it (generic context)
+        ],
+        n=5,
+        primary_metric="input_cost_usd",
+        expected_symbols=_public_api(),
+    )
+
+
+def context_decompose_experiment() -> Experiment:
+    """v2.5: a **3-arm** experiment that splits the costly-trim cost into *direct* vs *behavioral*.
+
+    Cutting the convention cost +5.5%, but we couldn't tell how much was the smaller file (direct)
+    vs the model sprawling (behavioral). Running all three context files in **one interleaved batch**
+    (so they share cache warmth) decomposes it:
+      - ``verbose -> lean``: filler removed, convention (behavior) **held** -> ~direct size effect.
+      - ``lean -> lean-costly``: convention removed at near-constant size -> the pure **behavioral** effect.
+      - ``verbose -> lean-costly``: the total (should ≈ compose of the two).
+    Reuses the three existing context files — no new context. **Heavy** (3 arms x n), so it is opt-in:
+    the CLI refuses to run it for real without an explicit ``--confirm-spend`` flag.
+    """
+    return Experiment(
+        id="v2-context-decompose",
+        fixture_dir=FIXTURE_DIR,
+        prompt=_prompt("context-explain"),
+        model="sonnet",
+        allowed_tools="Read,Write",
+        arms=[
+            Arm(name="verbose", context=_context("verbose")),         # big + convention
+            Arm(name="lean", context=_context("lean")),               # small + convention
+            Arm(name="lean-costly", context=_context("lean-costly")),  # small, no convention
+        ],
+        n=5,
+        primary_metric="input_cost_usd",
+        expected_symbols=_public_api(),
+    )
+
+
 # Registry: friendly id -> builder. The CLI's --exp selects from these.
 EXPERIMENTS = {
     "list-api": list_api_experiment,
     "summarize": summarize_experiment,
     "explain": explain_experiment,
+    "context-lean": context_lean_experiment,
+    "context-costly": context_costly_experiment,
+    "context-decompose": context_decompose_experiment,
 }
 
 DEFAULT_EXPERIMENT = "explain"

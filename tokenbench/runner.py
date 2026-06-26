@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import quality
+from . import quality, stats
 from .experiment import Arm, Experiment
 
 # Path to the dry-run stub that mimics claude's JSON output for $0.
@@ -30,10 +30,14 @@ def build_command(
     model: str,
     allowed_tools: str,
     append_system_prompt: str | None = None,
-    bare: bool = True,
+    bare: bool = False,
 ) -> list[str]:
     """Build the full headless invocation. ``base_cmd`` is the binary prefix
-    (``["claude"]`` for real runs, ``[python, stub]`` for dry runs)."""
+    (``["claude"]`` for real runs, ``[python, stub]`` for dry runs).
+
+    ``bare`` defaults False: this machine authenticates via OAuth, and ``--bare`` only
+    accepts ANTHROPIC_API_KEY, so it can't run here (isolation comes from the temp cwd in
+    ``run_once`` instead). Callers pass ``exp.bare`` explicitly regardless."""
     cmd = list(base_cmd) + ["-p", prompt, "--output-format", "json", "--model", model]
     if bare:
         cmd.append("--bare")
@@ -53,6 +57,7 @@ def config_hash(exp: Experiment, arm: Arm) -> str:
             "allowed_tools": exp.allowed_tools,
             "bare": exp.bare,
             "append_system_prompt": arm.append_system_prompt,
+            "context": arm.context,
         },
         sort_keys=True,
     )
@@ -218,6 +223,11 @@ def run_once(exp: Experiment, arm: Arm, run_index: int, base_cmd: list[str],
     workdir = Path(tempfile.mkdtemp(prefix="tokenbench-"))
     try:
         shutil.copytree(exp.fixture_dir, workdir, dirs_exist_ok=True)
+        # v2 input/context lever: the arm's standing context is written as CLAUDE.md into this
+        # isolated cwd, so Claude Code auto-loads and re-injects it every turn. It is the single
+        # variable under test. Still a *known* controlled file — no parent-dir CLAUDE.md leaks in.
+        if arm.context is not None:
+            (workdir / "CLAUDE.md").write_text(arm.context, encoding="utf-8")
         try:
             proc = subprocess.run(
                 cmd, cwd=workdir, capture_output=True, text=True, timeout=exp.timeout_s,
@@ -246,13 +256,13 @@ def run_once(exp: Experiment, arm: Arm, run_index: int, base_cmd: list[str],
     return rec
 
 
-def _build_judge(exp: Experiment, base_cmd: list[str], samples: int = 1):
-    """An isolated, time-bounded JudgeScorer that grades each artifact against the task.
+def _temp_cwd_runner(exp: Experiment):
+    """A ``cmd -> stdout`` runner that executes a judge subprocess in a fresh temp cwd.
 
-    The judge subprocess runs in a fresh temp cwd (no project ``CLAUDE.md`` to bias it) using
-    the same binary as the task (real ``claude``, or the stub for dry runs). ``samples`` LLM
-    grades per artifact are averaged to damp single-call noise."""
-    def _judge_run(cmd: list[str]) -> str:
+    The fresh cwd (no project ``CLAUDE.md``) keeps the judge from being biased by any standing
+    context, and the same binary as the task is used (real ``claude``, or the stub for dry runs).
+    Shared by the absolute and pairwise judges."""
+    def _run(cmd: list[str]) -> str:
         d = Path(tempfile.mkdtemp(prefix="tokenbench-judge-"))
         try:
             proc = subprocess.run(cmd, cwd=d, capture_output=True, text=True, timeout=exp.timeout_s)
@@ -260,21 +270,30 @@ def _build_judge(exp: Experiment, base_cmd: list[str], samples: int = 1):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
-    return quality.JudgeScorer(exp.prompt, runner=_judge_run, base_cmd=tuple(base_cmd),
-                               samples=samples)
+    return _run
+
+
+def _build_judge(exp: Experiment, base_cmd: list[str], samples: int = 1, adaptive: bool = False):
+    """An isolated, time-bounded JudgeScorer that grades each artifact against the task.
+
+    ``samples`` LLM grades per artifact are averaged to damp single-call noise; ``adaptive`` stops
+    early once the grades agree (``samples`` then acts as the cap), to avoid over-spending."""
+    return quality.JudgeScorer(exp.prompt, runner=_temp_cwd_runner(exp), base_cmd=tuple(base_cmd),
+                               samples=samples, adaptive=adaptive)
 
 
 def rejudge(exp: Experiment, base_cmd: list[str] | None = None, samples: int = 3,
-            dry_run: bool = False) -> Path:
+            dry_run: bool = False, adaptive: bool = False) -> Path:
     """Re-score the saved artifacts in ``exp``'s ``runs.jsonl`` with an averaged judge.
 
     Because each record stores its ``artifact_text``, this spends judge tokens only — no task
     re-runs — so it is the cheap way to tighten noisy judge numbers after the fact. Only
-    judge_* fields are rewritten; tokens/coverage/timing are left untouched.
+    judge_* fields are rewritten; tokens/coverage/timing are left untouched. ``adaptive`` stops
+    sampling early once the grades agree (``samples`` is then the cap), to cut judge calls.
     """
     if base_cmd is None:
         base_cmd = [sys.executable, str(STUB)] if dry_run else ["claude"]
-    judge_scorer = _build_judge(exp, base_cmd, samples=samples)
+    judge_scorer = _build_judge(exp, base_cmd, samples=samples, adaptive=adaptive)
 
     path = exp.runs_file()
     records: list[dict] = []
@@ -301,6 +320,113 @@ def rejudge(exp: Experiment, base_cmd: list[str] | None = None, samples: int = 3
             fh.write(json.dumps(rec) + "\n")
     print(f"re-judged {scored} artifacts @ {samples} samples -> {path}", flush=True)
     return path
+
+
+def _arm_artifacts(records: list[dict], arm: str) -> list[dict]:
+    """Valid records for one arm that carry artifact text, sorted by run_index (stable pairing)."""
+    rows = [r for r in records if r.get("arm") == arm and r.get("valid")
+            and r.get("artifact_text")]
+    return sorted(rows, key=lambda r: (r.get("run_index", 0), r.get("timestamp", "")))
+
+
+def pairwise_judge(exp: Experiment, base_cmd: list[str] | None = None, dry_run: bool = False,
+                   seed: int = 0) -> dict:
+    """Blind pairwise re-judge of an experiment's saved artifacts (judge tokens only).
+
+    De-confounds the absolute judge's length bias: instead of grading each artifact alone (where
+    a longer answer scores higher), it shows the judge two answers — one per arm — and asks which
+    better fulfills the task. Each cross-arm pair is judged in **both** A/B orders; an arm only
+    "wins" the pair when preferred in both orders, so a position-sensitive (split) decision counts
+    as a tie. Pairs are formed by ``run_index`` across arms (reproducible). No task re-runs.
+
+    Writes raw per-pair decisions to ``results/<id>-pairwise/pairwise.jsonl`` and returns a summary
+    dict (lean win / tie / verbose win counts, the lean win-rate, and per-arm artifacts/lengths).
+    """
+    if base_cmd is None:
+        base_cmd = [sys.executable, str(STUB)] if dry_run else ["claude"]
+    scorer = quality.PairwiseJudgeScorer(exp.prompt, runner=_temp_cwd_runner(exp),
+                                         base_cmd=tuple(base_cmd))
+
+    base_arm, treat_arm = exp.arms[0].name, exp.arms[1].name  # verbose (baseline) vs lean (treatment)
+    records = stats.load_records(exp.runs_file())
+    base_rows = _arm_artifacts(records, base_arm)
+    treat_rows = _arm_artifacts(records, treat_arm)
+    pairs = list(zip(base_rows, treat_rows))  # index-aligned by run_index
+    if not pairs:
+        raise ValueError(
+            f"no paired artifacts for {base_arm!r} vs {treat_arm!r} in {exp.runs_file()}; "
+            "run with --judge first so artifact_text is saved"
+        )
+
+    def _arm_pref(winner: str, treat_is: str) -> str:
+        """Map a single ordering's raw winner (A/B/tie) to the arm it favors."""
+        if winner == "tie":
+            return "tie"
+        favored = winner  # 'A' or 'B'
+        return treat_arm if favored == treat_is else base_arm
+
+    decisions: list[dict] = []
+    treat_wins = base_wins = ties = 0
+    judge_cost_usd = 0.0
+    judge_calls = 0
+    for idx, (b, t) in enumerate(pairs):
+        try:
+            # Order 1: A=baseline, B=treatment.  Order 2: swapped, to cancel position bias.
+            o1 = scorer.compare(b["artifact_text"], t["artifact_text"])
+            o2 = scorer.compare(t["artifact_text"], b["artifact_text"])
+            judge_cost_usd += (o1.get("cost_usd") or 0.0) + (o2.get("cost_usd") or 0.0)
+            judge_calls += 2
+            pref1 = _arm_pref(o1["winner"], treat_is="B")
+            pref2 = _arm_pref(o2["winner"], treat_is="A")
+        except Exception as e:  # noqa: BLE001 - one bad pair must not abort the batch
+            decisions.append({"pair_index": idx, "error": f"{type(e).__name__}: {e}"[:200]})
+            continue
+        if pref1 == treat_arm and pref2 == treat_arm:
+            outcome = treat_arm
+            treat_wins += 1
+        elif pref1 == base_arm and pref2 == base_arm:
+            outcome = base_arm
+            base_wins += 1
+        else:  # split (position-sensitive) or any tie
+            outcome = "tie"
+            ties += 1
+        decisions.append({
+            "pair_index": idx,
+            "base_run_index": b.get("run_index"), "treat_run_index": t.get("run_index"),
+            "order1_winner_arm": pref1, "order2_winner_arm": pref2,
+            "outcome": outcome,
+            "order1_reason": o1.get("reason"), "order2_reason": o2.get("reason"),
+        })
+        print(f"[pair {idx}] {base_arm} vs {treat_arm}: {pref1}/{pref2} -> {outcome}", flush=True)
+
+    decided = treat_wins + base_wins + ties
+    # Lean win-rate with ties as half-credit (a Wilcoxon-style score in [0,1]); 0.5 == no preference.
+    win_rate = (treat_wins + 0.5 * ties) / decided if decided else None
+
+    def _mean_out(rows: list[dict]) -> float | None:
+        outs = [r.get("output_tokens") for r in rows if isinstance(r.get("output_tokens"), (int, float))]
+        return sum(outs) / len(outs) if outs else None
+
+    summary = {
+        "experiment": exp.id,
+        "baseline_arm": base_arm, "treatment_arm": treat_arm,
+        "n_pairs": len(pairs), "n_decided": decided,
+        "treatment_wins": treat_wins, "baseline_wins": base_wins, "ties": ties,
+        "treatment_win_rate": win_rate,
+        "base_mean_output": _mean_out(base_rows), "treat_mean_output": _mean_out(treat_rows),
+        "judge_cost_usd": judge_cost_usd, "judge_calls": judge_calls,
+        "seed": seed,
+    }
+
+    out_dir = exp.results_dir / (exp.id + "-pairwise")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "pairwise.jsonl"
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"summary": summary}) + "\n")
+        for d in decisions:
+            fh.write(json.dumps(d) + "\n")
+    print(f"wrote {len(decisions)} pairwise decisions -> {out_path}", flush=True)
+    return summary
 
 
 def run_experiment(exp: Experiment, base_cmd: list[str] | None = None,

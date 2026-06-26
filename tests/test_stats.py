@@ -196,3 +196,125 @@ def test_compare_arms_and_report_include_judge():
     text = stats.format_report(cmp)
     assert "judge quality (0-10)" in text
     assert "judge change" in text
+
+
+# --- v2: cache-aware input lever -------------------------------------------------------
+
+def _crec(arm, i, *, cc, cr, out, inp=5, cost=None):
+    """A v2-shaped record carrying the cache split. cost defaults to the priced reconstruction."""
+    rec = {
+        "experiment": "t", "arm": arm, "run_index": i, "valid": True,
+        "input_tokens": inp, "output_tokens": out,
+        "cache_creation_tokens": cc, "cache_read_tokens": cr,
+        "total_tokens": inp + out + cc + cr,
+    }
+    rec["total_cost_usd"] = stats.predicted_total_cost_usd(rec) if cost is None else cost
+    return rec
+
+
+def test_input_cost_usd_decomposition():
+    rec = {"input_tokens": 5, "cache_creation_tokens": 4000, "cache_read_tokens": 12000,
+           "output_tokens": 1400}
+    # Input lever = fresh input + cache creation + cache read, priced by the stats constants.
+    expected_in = (5 * stats.PRICE_INPUT + 4000 * stats.PRICE_CACHE_CREATION
+                   + 12000 * stats.PRICE_CACHE_READ)
+    assert math.isclose(stats.input_cost_usd(rec), expected_in, rel_tol=1e-12)
+    # Cache creation is priced at 2x base input (the 1-hour tier Claude Code provisions).
+    assert math.isclose(stats.PRICE_CACHE_CREATION, 2 * stats.PRICE_INPUT, rel_tol=1e-12)
+    # Output excluded from the input lever; included in the full reconstruction.
+    assert math.isclose(stats.predicted_total_cost_usd(rec),
+                        expected_in + 1400 * stats.PRICE_OUTPUT, rel_tol=1e-12)
+
+
+def test_cost_checksum_flags_drift_only_when_far():
+    rec = {"input_tokens": 5, "cache_creation_tokens": 4000, "cache_read_tokens": 12000,
+           "output_tokens": 1400}
+    matched = dict(rec, total_cost_usd=stats.predicted_total_cost_usd(rec))
+    assert stats.cost_checksum(matched) < 1e-9                     # priced == reported
+    drifted = dict(rec, total_cost_usd=stats.predicted_total_cost_usd(rec) * 2)
+    assert stats.cost_checksum(drifted) > stats.PRICE_CHECKSUM_TOL  # 100% off -> flagged
+    assert stats.cost_checksum(dict(rec, total_cost_usd=None)) is None
+    assert stats.cost_checksum(dict(rec, total_cost_usd=0)) is None
+
+
+def test_augment_record_backfills_and_derives():
+    rec = {"input_tokens": 5, "output_tokens": 100}                # legacy row, no cache fields
+    stats.augment_record(rec)
+    assert rec["cache_creation_tokens"] == 0 and rec["cache_read_tokens"] == 0
+    assert rec["input_cost_usd"] == stats.input_cost_usd(rec)
+
+
+def test_primary_metric_drives_the_verdict():
+    # Output is identical across arms (no separation), but the cache-heavy verbose arm costs more
+    # on the input side. Which lever you judge on flips the verdict — the core of v2.
+    base = [_crec("verbose", i, cc=cc, cr=cr, out=1000)
+            for i, (cc, cr) in enumerate([(5200, 15500), (5150, 15400), (5250, 15600),
+                                          (5180, 15450), (5210, 15550)])]
+    treat = [_crec("lean", i, cc=cc, cr=cr, out=1000)
+             for i, (cc, cr) in enumerate([(4200, 12500), (4150, 12400), (4250, 12600),
+                                           (4180, 12450), (4210, 12550)])]
+
+    on_output = stats.compare_arms(base + treat, "verbose", "lean", primary_metric="output_tokens")
+    assert on_output["separated"] is False                        # identical output => no signal
+
+    on_input = stats.compare_arms(base + treat, "verbose", "lean", primary_metric="input_cost_usd")
+    assert on_input["separated"] is True                          # cache cost clearly separates
+    assert on_input["primary_metric"] == "input_cost_usd"
+    assert on_input["deltas"]["input_cost_usd"]["pct_reduction"] > 0   # lean cheaper on input
+    assert on_input["cost_checksum"] < 1e-9                       # default cost == reconstruction
+
+
+def test_format_report_v2_cache_aware_block():
+    base = [_crec("verbose", i, cc=5200, cr=15500, out=1000) for i in range(3)]
+    # vary lean a touch so variance is non-zero
+    treat = [_crec("lean", i, cc=cc, cr=cr, out=1000)
+             for i, (cc, cr) in enumerate([(4200, 12500), (4250, 12600), (4180, 12450)])]
+    text = stats.format_report(
+        stats.compare_arms(base + treat, "verbose", "lean", primary_metric="input_cost_usd"))
+    assert "cache_creation_tokens" in text and "cache_read_tokens" in text
+    assert "input_cost_usd" in text
+    assert "cache-aware input:" in text
+    assert "primary lever: input_cost_usd" in text
+    assert "input-cost difference is significant" in text
+    assert "cache_read (warm" in text                             # the cache-state caveat is stated
+
+
+# --- spend breakdown (1b) ---------------------------------------------------------------
+
+def test_budget_breakdown_splits_task_and_judge():
+    recs = [dict(_crec("verbose", i, cc=4000, cr=12000, out=1000),
+                 judge_cost_usd=0.006, judge_calls=3) for i in range(4)]
+    b = stats.budget_breakdown(recs)
+    assert b["n"] == 4 and b["n_judged"] == 4
+    # task cache cost = 4000*PRICE_CC + 12000*PRICE_CR
+    expected_cache = 4000 * stats.PRICE_CACHE_CREATION + 12000 * stats.PRICE_CACHE_READ
+    assert math.isclose(b["task_cache_cost"], expected_cache, rel_tol=1e-9)
+    assert math.isclose(b["judge_cost"], 0.006, rel_tol=1e-9)
+    assert b["judge_calls"] == 3
+    assert math.isclose(b["judged_run_cost"], b["task_cost"] + 0.006, rel_tol=1e-9)
+
+
+def test_budget_breakdown_no_judge_data():
+    recs = [_crec("verbose", i, cc=4000, cr=12000, out=1000) for i in range(3)]
+    b = stats.budget_breakdown(recs)
+    assert b["n_judged"] == 0 and b["judge_cost"] == 0.0
+    assert "no judged runs" in stats.format_budget_report(recs)
+
+
+def test_budget_breakdown_empty_is_none():
+    assert stats.budget_breakdown([]) is None
+
+
+# --- 3-arm cost decomposition (Part 2) --------------------------------------------------
+
+def test_decomposition_splits_direct_and_behavioral():
+    # verbose (big cache) -> lean (smaller) -> lean-costly (smaller still but sprawls in output).
+    verbose = [_crec("verbose", i, cc=5200, cr=15500, out=1000) for i in range(4)]
+    lean = [_crec("lean", i, cc=cc, cr=cr, out=950)
+            for i, (cc, cr) in enumerate([(4200, 12500), (4250, 12600), (4180, 12450), (4210, 12520)])]
+    leancostly = [_crec("lean-costly", i, cc=cc, cr=cr, out=1800)   # output sprawls
+                  for i, (cc, cr) in enumerate([(4100, 13500), (4150, 13600), (4120, 13450), (4130, 13520)])]
+    text = stats.format_decomposition_report(verbose + lean + leancostly)
+    assert "DIRECT" in text and "BEHAVIORAL" in text and "TOTAL" in text
+    assert "verbose -> lean" in text
+    assert "size cut, behavior held" in text

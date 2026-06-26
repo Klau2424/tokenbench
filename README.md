@@ -152,10 +152,16 @@ python -m tokenbench run --dry-run
 ### Real run (~10 minutes, ~$1.08 total)
 
 ```bash
-python -m tokenbench run                 # default task (explain)
-python -m tokenbench run --exp list-api  # a different task in the v1 suite
-python -m tokenbench run --judge         # also grade each artifact with an LLM judge (more tokens)
-python -m tokenbench judge --exp explain # re-score saved artifacts with an averaged judge (cheap)
+python -m tokenbench run                     # default task (explain)
+python -m tokenbench run --exp list-api      # a different task in the v1 suite
+python -m tokenbench run --exp context-lean  # v2 input lever: verbose vs lean standing context
+python -m tokenbench run --judge             # also grade each artifact with an LLM judge (more tokens)
+python -m tokenbench judge --exp explain     # re-score saved artifacts with an averaged judge (cheap)
+python -m tokenbench judge --exp context-lean --adaptive  # stop sampling early once grades agree (fewer judge calls)
+python -m tokenbench pairwise --exp context-costly  # blind A/B re-judge of saved artifacts (de-confounds length)
+python -m tokenbench budget --exp context-lean      # spend breakdown: task cache vs output vs judge
+python -m tokenbench run --exp context-decompose --confirm-spend  # opt-in 3-arm direct-vs-behavioral cost split
+python -m tokenbench decompose --exp context-decompose            # print the 3-arm decomposition report
 ```
 
 Writes to `results/<experiment>/runs.jsonl`. Each run costs ~$0.10–$0.12. Runs **accumulate**
@@ -174,22 +180,34 @@ python -m tokenbench report --exp explain
 pytest
 ```
 
-48 tests covering stats math (Welch t-test, known critical values, Cohen's d, required-n,
-bootstrap CIs), the coverage and LLM-judge quality scorers (multi-sample averaging, graceful
-failure, $0 stub), runner parsing, replication accumulation, and artifact re-judging.
+78 tests covering stats math (Welch t-test, known critical values, Cohen's d, required-n,
+bootstrap CIs), the cache-aware decomposition (`input_cost_usd` + the reported-cost checksum,
+configurable primary metric), the coverage and LLM-judge quality scorers (multi-sample averaging,
+adaptive early-stop, captured judge spend, graceful failure, $0 stub), the blind pairwise judge
+(winner parsing, both-orders position-bias cancellation, $0 stub), the spend breakdown and 3-arm
+cost decomposition, the multi-arm `--confirm-spend` gate, runner parsing, standing-context injection,
+replication accumulation, and artifact re-judging.
 
 ---
 
 ## Limitations / status
 
-tokenbench is at v1. The rig pairs every result with two quality signals — a free coverage
-metric (are the public symbols named?) and an opt-in LLM judge (a 0-10 grade against the
-task) — runs a small task suite (objective → free-form), accumulates replications, and
-reports power and bootstrap CIs. It is still deliberately narrow: one fixture, one model,
-small n, and a blunt terseness rule rather than a subtle technique. Coverage is completeness
-only; the judge is an uncalibrated LLM grade (averaged over a few calls), so read its
-direction and significance, not its exact number. The thesis stands: build a credible
-measurement rig before measuring any technique.
+tokenbench is at v2, measured on real tokens. The rig pairs every result with two quality
+signals — a free coverage metric (are the public symbols named?) and an opt-in LLM judge (a 0-10
+grade against the task) — runs a small task suite (objective → free-form), accumulates
+replications, and reports power and bootstrap CIs. **v2 added the input/context lever**: a
+cache-aware `input_cost_usd` (cache_creation/cache_read reported separately) and verbose-vs-lean
+standing-context experiments, now run for real — finding that trimming standing context is *not*
+free in either direction (see the v2 roadmap entry). It is still deliberately narrow: one fixture,
+one model, small n. Coverage is completeness only; the absolute judge is an uncalibrated LLM grade
+and is **length-tilted** (it mildly rewards longer answers) — the report flags that inline when arms
+diverge in length, and `tokenbench pairwise` gives the length-robust read (a blind, both-orders A/B
+re-judge of saved artifacts). That de-confound *confirmed* the free-trim quality drop but *corrected*
+the costly-trim case, so read judge direction + significance, not the exact 0-10 number. Input is
+cache-dominated, so cache state across runs is a confound — read
+the cache_creation/cache_read split, not just totals or cost; and a context edit's measured
+input-cost change can be a second-order *behavioral* effect, not a direct token saving. The thesis
+stands: build a credible measurement rig before measuring any technique.
 
 See [`RESEARCH.md`](RESEARCH.md) for the full decision log (token capture method, environment
 constraints, every experiment run, honest account of what worked and what didn't) and
@@ -224,10 +242,40 @@ constraints, every experiment run, honest account of what worked and what didn't
   survives averaging. Two independent scorers converging on the constrained tasks and diverging
   on the open-ended one is the cleanest evidence that the 52% cut there *does* cost quality.
   Full write-up in [`RESEARCH.md`](RESEARCH.md).
-- **v2 (intent)** — a real reduction technique, targeting the input/context lever (what loads
-  and re-injects each turn). The output-terseness lever is already owned by existing tools;
-  the input side is less explored and cache-dominated in ways that need careful measurement.
-- **v3 (intent)** — package the proven technique as a Claude Code skill.
+- **v2 (measured on real tokens)** — the **input/context** lever (what loads and re-injects each
+  turn), where existing tools don't compete. Technique: *lean standing context* — the same task
+  run with a **verbose** vs **lean** `CLAUDE.md` auto-loaded every turn. Input is cache-dominated,
+  so separation is judged on a cache-aware **`input_cost_usd`** (priced fresh-input + cache-creation
+  + cache-read, checksummed against Claude's reported cost — which **caught a real pricing error**:
+  Claude Code uses the 1-hour cache at $6/Mtok, not the 5-min tier). Two real experiments separated
+  cleanly and **falsify "shrink your `CLAUDE.md`, it's free" in both directions**:
+
+  | trim | n | input cost | judge quality | pairwise (length-robust) | reading |
+  |---|---|---|---|---|---|
+  | filler only (keep convention) | 10 | **−6.7%** (cheaper) | **−1.2/10** (sig.) | verbose preferred, lean win-rate **0.10** | filler bought *quality* |
+  | filler + the convention | 12 | **+5.5%** (*dearer*) | +1.2 | lean preferred, lean win-rate **0.96** | convention traded *quality for cost* |
+
+  Cutting prose saves cost but loses quality (coverage was blind; the judge caught it). Cutting the
+  prescriptive convention costs *more* — the unconstrained model sprawls (+88% output) while
+  `cache_creation` barely moves, so the cost swing is a **second-order behavioral effect**, not the
+  context's direct size. A **blind pairwise re-judge** (`tokenbench pairwise`, position- and
+  length-controlled) then de-confounded the absolute judge: it *confirmed* the free-trim drop but
+  *corrected* the costly-trim case — the longer no-convention answer is robustly preferred, so the
+  convention traded judged-quality for cost-discipline. Full write-up in [`RESEARCH.md`](RESEARCH.md).
+- **v2.5 (token-efficiency, measured)** — get more data per dollar. A spend audit found a task run is
+  ~98% cache / ~80% `cache_read` — Claude Code's fixed system prompt, **unshrinkable** here (needs
+  `--bare`, blocked by OAuth) — so the lever is the **judge**, where instrumenting the
+  previously-discarded spend revealed each judge call costs **~$0.063 and pays a cold cache** (the
+  judge is ~3× a task run, not a rounding error). **Adaptive judge sampling** cut calls **48%** (verdict
+  direction held; it's a cost screen, `pairwise` is the precision backstop); dropping the unused `Edit`
+  tool is safe but saves ~0 (system prompt dwarfs tool schemas). New: `tokenbench budget` (spend
+  breakdown) and an opt-in, `--confirm-spend`-gated **3-arm `context-decompose`** that splits the
+  costly-trim cost into direct (size) vs behavioral (sprawl) legs. **Next, unbuilt:** warm the judge
+  cache (a shared cwd / batching) to stop re-paying that cold block — plausibly a bigger win than
+  adaptive. Full write-up in [`RESEARCH.md`](RESEARCH.md).
+- **v3 (intent)** — package a proven technique as a Claude Code skill. v2's twist: the honest
+  technique is task-dependent — "keep a tight, prescriptive convention" buys cost-discipline, but on
+  open-ended tasks that brevity can cost quality, so "make the context short" is not free either way.
 
 ---
 

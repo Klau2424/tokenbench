@@ -18,3 +18,4 @@ fixtures/**/NOTES.md
 
 # Throwaway dry-run output (stub data, never real results)
 results/*-dryrun/
+results/*dryrun*/

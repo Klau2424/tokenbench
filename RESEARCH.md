@@ -179,13 +179,202 @@ Judge caveats: the judge is itself an LLM — now a mean of 3 calls per artifact
 uncalibrated and small-n. It measures *relative* quality between arms, not an absolute grade.
 Treat the **direction and significance**, not the exact number.
 
+## v2 — the input/context lever, measured cache-aware (2026-06-24)
+
+v2 moves off the output-terseness lever (owned by existing tools) onto the **input/context**
+lever — "what loads and re-injects each turn." The technique under test is *lean standing
+context*: the same task is run with a **verbose** vs **lean** `CLAUDE.md` auto-loaded into the
+run's cwd every turn. The only variable is the bytes of that one file — the tightest possible A/B.
+
+### Why this needs a new metric (the cache problem)
+
+v1 already showed input is **cache-dominated**: raw input is ~5 tokens, while 50–65k
+cache_read/creation dominate volume. So "I trimmed 600 context tokens" is almost invisible in
+*total tokens* and only partly visible in *cost*, because cached input prices **20× apart**:
+`cache_creation` (cold load, **2× base input** = $6/Mtok — see below) vs `cache_read` (warm
+re-inject, ~0.1× = $0.30/Mtok). v2 adds a cache-aware decomposition,
+**`input_cost_usd` = fresh·p_in + creation·p_cc + read·p_cr**, and judges separation on *that*
+instead of output tokens (`Experiment.primary_metric`). The reported `total_cost_usd` stays the
+dollar source of truth; a checksum flags the price table if our priced reconstruction drifts >25%
+from it. cache_creation and cache_read are reported **separately** — never summed — because they
+move differently with cache warmth.
+
+**The checksum earned its keep on the first real run.** At an assumed 5-min cache-write price
+($3.75/Mtok) the priced reconstruction came out 28% below Claude's reported `total_cost_usd` and
+the checksum fired. Backing the residual out of real reported costs gave $6.04/Mtok = **2.01×
+base input** — Claude Code provisions the **1-hour** cache, not the 5-min tier. Fixed
+`PRICE_CACHE_CREATION` to $6/Mtok; the gap dropped to <1% (the remainder is a small Haiku helper
+model the checksum absorbs). The correction *increased* the measured input-cost reductions
+slightly, since the lever moves cache_creation more than cache_read and creation is now weighted
+more. A guardrail catching a real pricing error before it reached a result is exactly the point.
+
+### The cache-state confound (now the central methodology)
+
+Each run is a fresh `claude -p`, but server-side prompt caching is content-keyed with a short
+TTL, so run 0 of an arm tends to pay `cache_creation` (cold) while warm runs pay `cache_read`.
+This is now the **signal**, not just noise. Handling: report the creation/read split separately,
+keep round-robin interleaving so warmth spreads evenly across arms, and state plainly that the
+honest dollar story differs by regime — warm (cache_read-dominated, small $ saving) vs cold
+(cache_creation-dominated, real $ saving). A `--cold` mode that perturbs context per run to force
+the cold regime is a deliberate future option, not in v2.0.
+
+### Rig scope: single-turn is sufficient
+
+Kept the single-shot `claude -p`. Re-injection is already captured: a run's internal turns
+(`num_turns` up to ~3) re-read the cached context, so `cache_read` reflects per-turn re-injection
+without a multi-turn rewrite. Genuine multi-turn (where re-injection compounds) is deferred.
+
+### Real results (2026-06-25): trimming standing context is NOT free — in either direction
+
+Two experiments, same fixture/task/model (`claude-sonnet-4-6`), 3→5-sample averaged judge,
+interleaved. The verbose baseline (`contexts/verbose.md`, ~1,190 tokens: a load-bearing NOTES
+convention wrapped in project "filler" — philosophy, style, working agreements) is identical in
+both. Only the lean arm differs. Data: `results/v2-context-{lean,costly}-judged/`.
+
+| experiment | lean arm trims | n/arm | input cost (verbose→lean) | Welch p | Cohen's d | judge (0-10) | coverage |
+|---|---|---|---|---|---|---|---|
+| `context-lean` (free) | filler only (keeps convention) | 10 | $0.0981 → $0.0916 **−6.7%** | 0.0000 | +13.3 | 5.1 → 3.9 **−1.2** (−1.9,−0.5) | 1.00→1.00 |
+| `context-costly` | filler **+ the convention** | 12 | $0.0980 → $0.1034 **+5.5% (dearer)** | 0.0125 | −1.2 | 4.8 → 6.0 **+1.2** (+0.4,+2.1) | 1.00→1.00 |
+
+Both SEPARATED on `input_cost_usd`. Read together they **decompose what standing context does**,
+and it is not "dead weight you pay to carry":
+
+**1. The "filler" was buying quality (free-trim).** Cutting only the prose — keeping the
+convention in both arms — made the lean run **6.7% cheaper on input** (rock-solid, d=13, the
+cache regime is warm and stable to ±tens of tokens so a ~1,000-token contrast separates trivially)
+**but cost −1.2/10 judge quality** (significant after 5-sample de-noise; the 3-sample pass
+understated it at −0.8). Name-coverage was **blind** (held 1.00), as on v1 `explain` — the judge
+carried the whole signal. So the project's own "short file + link out" instinct is *not* free
+here: the background material the lean file dropped measurably helped the answer.
+
+**2. The convention was buying *efficiency* (costly-trim) — and trimming it cost *more*, not
+less.** Dropping the prescriptive NOTES convention (lean-costly ≈ 30 tokens) did **not** make the
+run cheaper. The unconstrained model **sprawled**: output **+88%** (934 → 1,753 tokens), cache_read
+**+27%**, latency up — so `input_cost` rose **5.5%** even though the lean context was ~1,150 tokens
+*smaller*. Tellingly, **`cache_creation` barely moved (+0.4%)**: the direct token cost of the
+context change was negligible; the cost swing was almost entirely the **second-order behavioral
+effect** of removing the structure. The absolute judge *rose* +1.2 — which the first write-up
+dismissed as a pure **length confound** (it mildly rewards the +88% longer answer). **The blind
+pairwise re-judge below overturns that dismissal**: position-controlled and length-discounted, the
+lean output is still preferred 11/12, so the +1.2 is a *real* judged-quality preference, not an
+artifact. The honest reading flips with it: dropping the convention did not just make the model
+"ramble" — it produced a longer, costlier answer the judge genuinely rates higher. So the
+convention was buying **cost-discipline / brevity**, and on this open-ended task that brevity came
+at a (judge-assessed) **quality cost** — a real tradeoff, not a free efficiency win.
+
+**The unifying lesson (and the myth punctured):** "shrink your `CLAUDE.md`, it's free tokens" is
+false on this fixture in *both* directions — cut the prose and you lose quality; cut the structure
+and the model writes a longer, costlier, *and* better-judged answer (the convention traded quality
+for cost). And the headline measurement insight: **on the input lever a context edit's direct token
+cost can be dwarfed (even sign-flipped) by its indirect effect on model behavior** — which is
+invisible to anyone counting only context tokens, and exactly what a controlled cache-aware rig is
+needed to see.
+
+### De-confounding the judge: blind pairwise re-judge (2026-06-25, polish pass)
+
+The absolute 0-10 judge mildly rewards length, so its delta is suspect whenever the arms' output
+sizes differ — and on `context-costly` they differ 88%. To de-confound it without re-running any
+task, a **blind pairwise judge** re-scores the *saved* artifacts (judge tokens only): it sees both
+arms' answers and picks which better fulfills the task, with each pair judged in **both A/B orders**
+so position bias cancels (an arm "wins" only if preferred in both orders; a split counts as a tie).
+Win-rate counts a tie as half, so 0.50 = no preference.
+
+| experiment | lean output vs verbose | absolute judge Δ | pairwise lean win-rate (95% CI) | verdict |
+|---|---|---|---|---|
+| `context-lean` (free-trim) | −13% (shorter) | −1.2 | **0.10** (0.00, 0.25) | **verbose preferred** — confirms the −1.2 |
+| `context-costly` | +88% (longer) | +1.2 | **0.96** (0.88, 1.00) | **lean preferred** — corrects the "confound" |
+
+Two outcomes, both honest:
+
+- **Free-trim is confirmed.** The verbose (full-filler) answer wins 8/10 pairs (2 ties, 0 losses)
+  under a length-robust, position-controlled judge — the same direction as the −1.2 absolute drop.
+  The "filler bought quality" finding survives de-confounding.
+- **Costly-trim is corrected.** The lean (no-convention) answer wins 11/12 pairs (1 tie, 0 losses).
+  The earlier claim that its +1.2 was "the length confound, not a real gain" does **not** hold: even
+  when the judge is shown both answers, told to ignore length, and averaged over both orderings, it
+  robustly prefers the lean output. So the convention's brevity came at a genuine judged-quality
+  cost on this task. (Caveat: a single uncalibrated LLM can still carry a *residual* preference for
+  detail; pairwise removes position bias and the absolute scorer's length tilt, not every possible
+  confound. But the gap can no longer be attributed to either of those.)
+
+The methodological point this polish pass demonstrates: **a length-controlled re-judge reversed one
+of v2's two published quality conclusions** — at ~$0.18 of judge tokens and no task re-runs, because
+the artifacts were saved. The report now also prints a length-confound flag inline whenever the
+arms' output sizes diverge >25%, pointing at `tokenbench pairwise` as the length-robust read.
+
+## v2.5 — token-efficiency pass (2026-06-25)
+
+Goal: get more data out of a fixed budget by cutting tokens we lose *dumbly*. A spend audit first:
+every task run is ~98% cache and ~80% `cache_read` — the model re-reading a fixed ~13–14k/turn block
+(Claude Code's system prompt + tool schemas) that we **cannot shrink** (it needs `--bare`, which OAuth
+blocks here). So `num_turns` and that fixed block were ruled off-limits (keeps existing results
+comparable), and the search narrowed to the **judge**, where we spend in bulk and — it turned out —
+were flying blind.
+
+### The instrumentation paid for itself by exposing the real sink
+
+`JudgeScorer`/`PairwiseJudgeScorer` parsed the judge subprocess JSON but **discarded its `usage` +
+`total_cost_usd`** — so judge spend was literally unrecorded. Capturing it (now stored as
+`judge_cost_usd` + a token split per record, surfaced by `tokenbench budget`) immediately overturned
+the assumption that the judge is a rounding error:
+
+```
+per judge CALL: cache_creation=7,455 (COLD)  cache_read=17,231  cost=$0.063
+one judged artifact @ 5 samples = $0.31   vs a ~$0.11 task run
+```
+
+**The judge is ~3× the task run, not 4% of it** — and the reason is a second, unplanned dumb loss:
+each judge call runs in a **fresh temp cwd** (for isolation), so it **re-pays a cold `cache_creation`
+(~7.5k tokens at $6/Mtok) every single call** instead of reusing a warm cache. This is the biggest
+lever found and is **not yet addressed** (see Next): warming the judge cache (a stable shared cwd /
+batching) could move that 7.5k block from creation ($6/Mtok) toward read ($0.30/Mtok), a 20× price
+gap — potentially a larger win than cutting sample count.
+
+### What v2.5 built and measured
+
+- **Spend instrumentation (1a)** + **`tokenbench budget`** breakdown (1b): task-cache vs output vs
+  judge, with the judge's share of the judged-run bill. $0, on saved data.
+- **Adaptive judge sampling (1c)** — a floor of 2 grades, stop early once they agree (sd ≤ threshold),
+  cap at N. Validated on a copy of the real `context-lean` artifacts: **52 calls vs a fixed-5's 100
+  (48% fewer)**, verdict **direction preserved** (lean worse). Honest caveat: the point *magnitude*
+  moved (stored −1.20 → adaptive −0.63) because early-stop at n=2 locks in a noisier estimate — so
+  adaptive is a **cost screen, not a precision instrument**. That's acceptable because `pairwise` is
+  the precision backstop (it already confirmed verbose-preferred robustly).
+- **Tool-trim (1d)** — dropping the unused `Edit` tool is **safe** (task still completes, coverage
+  1.00) but saves **~0 tokens** (cache_read 54,624 vs 54,648 — within noise): the system prompt
+  dwarfs tool schemas. Applied only to the new decompose experiment (no existing data to fork).
+- **Opt-in 3-arm `context-decompose` (Part 2)** — reuses the three existing context files to split the
+  costly-trim cost into *direct* (verbose→lean, behavior held) vs *behavioral* (lean→lean-costly, ~constant
+  size) legs. **Built and stub-validated only**; running it for real is gated behind an explicit
+  `--confirm-spend` flag (it refuses a 3-arm real run otherwise). Awaits a deliberate user command.
+
+### Honest cost note
+
+The adaptive validation **cost $3.27, ~6× the ~$0.5 estimate** — precisely because per-call judge cost
+was unmeasured until this pass measured it ($0.005 assumed vs $0.063 real). The overrun is itself the
+evidence for why instrumenting spend mattered. Real spend then stopped pending direction.
+
 ## Limitations (non-negotiable to state)
 
-Single fixture, single machine, single model; n as shown. Two-sided Welch's t at α=0.05. The
-treatment is a blunt terseness rule, not a subtle technique. **Coverage is a name-mention
-completeness proxy** — it does not judge prose correctness or depth, so it under-detects
-quality loss on free-form tasks (see `explain` above). Token totals are cache-dominated, so
-cache state is a confound on input/total (compare the raw split). Directional, not general.
+Single fixture, single machine, single model; n as shown. Two-sided Welch's t at α=0.05.
+**Coverage is a name-mention completeness proxy** — it does not judge prose correctness or depth,
+so it under-detects quality loss on free-form tasks (it was blind on every v2 arm too). Token
+totals are cache-dominated, so cache state is a confound on input/total (compare the raw split).
+Directional, not general.
+
+v2-specific caveats: (a) **the absolute judge is length-tilted** — it mildly rewards longer answers,
+so a 0-10 delta is entangled with length whenever the arms' output sizes differ (as on `context-costly`,
+88% apart). This is now *addressed*, not just stated: the report flags the divergence inline, and the
+**blind pairwise re-judge** (`tokenbench pairwise`, both A/B orders) gives the length-robust read — which
+*confirmed* the free-trim drop but *corrected* the costly-trim case (the lean output is robustly preferred,
+0.96 win-rate, not a mere length artifact). Residual caveat: one uncalibrated LLM may still favor detail;
+pairwise removes position bias and the absolute scorer's length tilt, not every confound. (b) **The input
+lever is not cleanly isolated**: removing context changed the model's *behavior* (output length, turn
+count, re-reads),
+and that second-order effect, not the context's own size, drove the `input_cost` swing in
+`context-costly` (`cache_creation` moved only +0.4%). So `input_cost` separation is real but its
+*cause* is behavioral, not a direct context-size saving. (c) Single fixture/task: whether "filler
+buys quality / structure buys efficiency" generalizes is untested.
 
 ## Next
 
@@ -198,5 +387,28 @@ cache state is a confound on input/total (compare the raw split). Directional, n
   confirmed the `explain` drop is robust. Remaining knob: the judge CIs are now bound by the
   small **artifact count** (n=6–8), so the cheap-but-noisy lever is exhausted — tightening
   further means more task runs (or a stronger/calibrated judge model), not more samples.
-- **v2:** a real reduction technique on the input/context lever — note input here is
-  cache-dominated, so it must be measured in cache-aware terms.
+- **v2 (done — measured on real tokens):** the input/context lever, *lean standing context*,
+  judged on a cache-aware `input_cost_usd`. Two experiments separated cleanly: trimming filler is
+  6.7% cheaper but costs −1.2/10 quality (filler bought quality); trimming the prescriptive
+  convention costs *more* (+5.5%) via output sprawl (structure bought efficiency). "Shrink your
+  `CLAUDE.md`, it's free" is false in both directions on this fixture. The checksum caught a real
+  pricing error (1-hour cache, $6/Mtok) before it reached a result.
+- **v2 polish (done):** killed stale cruft (the report footer's pre-fix `1.25x` cache price, a stale
+  `required_n_for_d` docstring, an unused alias); added an inline length-confound flag; and built the
+  **blind pairwise judge** that de-confounded the judge — *confirming* the free-trim quality drop and
+  *correcting* the costly-trim case (its +1.2 is a real, position-and-length-robust preference, not a
+  length artifact). 66 tests; ~$0.18 of judge tokens, no task re-runs.
+- **v2.5 token-efficiency (done):** instrumented the previously-invisible judge spend (`judge_cost_usd`
+  + `tokenbench budget`), which exposed that the judge is ~3× a task run and pays a **cold cache every
+  call**; added adaptive judge sampling (48% fewer calls, verdict direction held — a cost screen);
+  confirmed tool-trim is safe-but-negligible; built the opt-in 3-arm `context-decompose` (stub-validated,
+  `--confirm-spend`-gated). 78 tests.
+- **Biggest open efficiency lever:** **warm the judge cache** — judge calls run in fresh temp cwds and
+  re-pay ~7.5k cold `cache_creation` tokens each ($6/Mtok); a stable shared cwd or batched judging could
+  shift that toward `cache_read` ($0.30/Mtok), plausibly a bigger win than adaptive. Not yet built.
+- **v2 follow-ups (open):** *run* the gated `context-decompose` to separate the context's *direct* token
+  cost from its *behavioral* effect; test whether the filler↔quality / convention↔cost-discipline split
+  generalizes beyond one fixture/model.
+- **v3:** package a proven technique as a Claude Code skill — but v2 shows the honest "technique"
+  may be "keep a tight prescriptive convention" (it both constrains cost and is cheap), not "make
+  the context short."
