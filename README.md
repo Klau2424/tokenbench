@@ -180,7 +180,7 @@ python -m tokenbench report --exp explain
 pytest
 ```
 
-78 tests covering stats math (Welch t-test, known critical values, Cohen's d, required-n,
+79 tests covering stats math (Welch t-test, known critical values, Cohen's d, required-n,
 bootstrap CIs), the cache-aware decomposition (`input_cost_usd` + the reported-cost checksum,
 configurable primary metric), the coverage and LLM-judge quality scorers (multi-sample averaging,
 adaptive early-stop, captured judge spend, graceful failure, $0 stub), the blind pairwise judge
@@ -270,9 +270,16 @@ constraints, every experiment run, honest account of what worked and what didn't
   direction held; it's a cost screen, `pairwise` is the precision backstop); dropping the unused `Edit`
   tool is safe but saves ~0 (system prompt dwarfs tool schemas). New: `tokenbench budget` (spend
   breakdown) and an opt-in, `--confirm-spend`-gated **3-arm `context-decompose`** that splits the
-  costly-trim cost into direct (size) vs behavioral (sprawl) legs. **Next, unbuilt:** warm the judge
-  cache (a shared cwd / batching) to stop re-paying that cold block — plausibly a bigger win than
-  adaptive. Full write-up in [`RESEARCH.md`](RESEARCH.md).
+  costly-trim cost into direct (size) vs behavioral (sprawl) legs. **Now run** (pooled n=7–8/arm):
+  cutting the convention costs **−13.9% (behavioral, +114% output sprawl)** vs only **+6.7% (direct, file
+  size)** — the input-lever cost swing is behavioral, not the file's footprint; and at matched size the
+  sprawl is judged better (pairwise 1.00), a real cost/quality tradeoff. Full write-up in [`RESEARCH.md`](RESEARCH.md).
+- **v2.7 (judge-cache warming, measured)** — the judge ran each call in a fresh `mkdtemp` cwd, and
+  because Claude Code embeds the cwd in its (cache-broken) system prompt, every call re-paid a cold
+  `cache_creation` (~7.5k tokens at $6/Mtok). Reusing **one stable cwd** across calls makes the cold
+  block collapse **~7,000 → 0** on warm calls — a controlled same-prompt A/B showed **~65–75% off per
+  warm call** (~68% at batch scale, stacking with adaptive sampling), proven for $0.40. Caveat: the
+  server cache has run-to-run noise. Full write-up in [`RESEARCH.md`](RESEARCH.md).
 - **v3 (intent)** — package a proven technique as a Claude Code skill. v2's twist: the honest
   technique is task-dependent — "keep a tight, prescriptive convention" buys cost-discipline, but on
   open-ended tasks that brevity can cost quality, so "make the context short" is not free either way.

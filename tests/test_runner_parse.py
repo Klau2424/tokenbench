@@ -246,3 +246,26 @@ def test_rejudge_rescores_only_saved_valid_artifacts(tmp_path):
     assert out[2].get("judge_score") is None            # invalid / no-artifact row left alone
     # Token/coverage fields are never touched by rejudge (none here to begin with).
     assert "output_tokens" not in out[0]
+
+
+def test_judge_runner_reuses_one_stable_cwd(tmp_path, monkeypatch):
+    """v2.7: every judge call must run in the SAME cwd (so Claude Code's cwd-bearing prompt prefix
+    stays cache-warm) — not a fresh mkdtemp per call, which re-paid a cold cache every time."""
+    exp = _mini_experiment(tmp_path, n=1)
+    seen_cwds: list[str] = []
+
+    class _FakeProc:
+        stdout = '{"result": "{\\"score\\": 7}"}'
+
+    def _fake_run(cmd, cwd, capture_output, text, timeout):
+        seen_cwds.append(str(cwd))
+        return _FakeProc()
+
+    monkeypatch.setattr(runner.subprocess, "run", _fake_run)
+    run = runner._temp_cwd_runner(exp)
+    run(["claude", "-p", "x"])
+    run(["claude", "-p", "y"])
+    run(["claude", "-p", "z"])
+
+    assert len(set(seen_cwds)) == 1                      # one stable cwd reused across all calls
+    assert seen_cwds[0] == str(run.cwd)                  # and it is the dir the runner created

@@ -220,3 +220,40 @@ shrinking it needs `--bare`, blocked by OAuth), so the search narrowed to the **
 - **Biggest open lever (not built):** **warm the judge cache** — a stable shared cwd / batched judging
   would stop re-paying that ~7.5k cold block every call ($6/Mtok → $0.30/Mtok), plausibly a larger win
   than adaptive sampling.
+
+## v2.7 — warming the judge cache (2026-06-27)
+
+Built the v2.5 "biggest open lever." The judge runner gave every call a fresh `mkdtemp` cwd; because
+Claude Code embeds the cwd in its (cache-broken) system prompt, each call re-paid a cold
+`cache_creation` (~7.5k tokens at $6/Mtok). A free diagnostic confirmed it (per-call cold creation was
+flat whether an artifact was graded 2× or 5× — only the cwd differed). Fix: `_temp_cwd_runner` now
+creates **one stable, empty cwd and reuses it across all judge calls** (removed at process exit);
+isolation unchanged (empty dir, no `CLAUDE.md`, judge writes nothing, sequential). +1 test (now 79).
+
+- **Controlled proof** (same prompt ×4, real `claude`, only the cwd varies): cold `cache_creation`
+  collapses **~7,000 → 0** on warm calls; per-warm-call cost **$0.063 → ~$0.016–0.022 (~65–75% off)**.
+  The 4-call aggregate read 46% only because one unavoidable cold first call dominates a tiny average;
+  at batch scale just the first call is cold (~68% off at 100 calls), and it **stacks with adaptive
+  sampling**. Proof cost $0.40 (under the $0.75 cap).
+- **Caveat:** server cache has run-to-run noise (one warm call partially re-created) — robust direction,
+  not a flat 75% every call. **Optional next:** a fixed cross-run cwd path to stay warm across batches
+  within the 1-hour cache TTL.
+
+## Decompose — direct vs behavioral cost of cutting the convention (2026-06-27)
+
+First real use of the opt-in 3-arm `context-decompose` (verbose / lean / lean-costly, run interleaved,
+`--confirm-spend`-gated). Closes the open v2 confound: how much of the costly-trim's cost is the smaller
+file (direct) vs the model sprawling (behavioral). Pooled n=7–8/arm (~$4.3 of the $6 cap; data in
+`results/v2-context-decompose{,-judged}/`).
+
+- **Cost legs (input_cost_usd):** DIRECT (verbose→lean, behavior held) **+6.7% cheaper**; BEHAVIORAL
+  (lean→lean-costly, ~same size) **−13.9% dearer via +114% output sprawl**; TOTAL (verbose→lean-costly)
+  −6.3% (n.s. — the two significant legs nearly cancel). So the input-lever cost swing is **behavioral,
+  not direct** — the convention's value is in constraining behavior, not its ~1k-token footprint.
+- **Behavioral-leg quality:** blind pairwise (both orders) `lean` vs `lean-costly` → **lean-costly
+  preferred 7/7 (1.00)**, output 2.3× longer. Removing the convention costs more *and* is judged better:
+  a real cost/quality tradeoff isolated from file size. Caveat: one uncalibrated judge may retain a
+  residual length/detail preference.
+- **Process note:** an accidental concurrent run split data across the `-judged` (judged) and plain
+  (task-only) dirs — no corruption, no waste (rows pooled for analysis); the cost decomposition is
+  judge-independent so pooling is valid.

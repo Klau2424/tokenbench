@@ -7,6 +7,7 @@ log): one process == one run == one result object carrying ``usage`` and
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import shutil
@@ -257,19 +258,28 @@ def run_once(exp: Experiment, arm: Arm, run_index: int, base_cmd: list[str],
 
 
 def _temp_cwd_runner(exp: Experiment):
-    """A ``cmd -> stdout`` runner that executes a judge subprocess in a fresh temp cwd.
+    """A ``cmd -> stdout`` runner that executes every judge subprocess in ONE reused, empty cwd.
 
-    The fresh cwd (no project ``CLAUDE.md``) keeps the judge from being biased by any standing
-    context, and the same binary as the task is used (real ``claude``, or the stub for dry runs).
-    Shared by the absolute and pairwise judges."""
+    The cwd is a dedicated empty dir (no project ``CLAUDE.md``), so the judge is never biased by
+    standing context; the same binary as the task is used (real ``claude``, or the stub for dry runs).
+    Shared by the absolute and pairwise judges.
+
+    **Why reuse one dir (the v2.7 fix):** Claude Code embeds the working directory in its system
+    prompt, which is a server-side prompt-cache breakpoint. The old runner made a *fresh* ``mkdtemp``
+    per call, so a new path busted that prefix every call and the judge re-paid a cold
+    ``cache_creation`` (~7.5k tokens at $6/Mtok) each time — even grading the identical prompt. Reusing
+    a single stable path keeps the prefix warm, so after the first call the block moves to
+    ``cache_read`` ($0.30/Mtok, a 20x gap). Safe to reuse: the judge writes no files (the dir stays
+    empty) and judging is sequential (no races). The dir is created once here and removed at process
+    exit."""
+    d = Path(tempfile.mkdtemp(prefix="tokenbench-judge-"))
+    atexit.register(lambda: shutil.rmtree(d, ignore_errors=True))
+
     def _run(cmd: list[str]) -> str:
-        d = Path(tempfile.mkdtemp(prefix="tokenbench-judge-"))
-        try:
-            proc = subprocess.run(cmd, cwd=d, capture_output=True, text=True, timeout=exp.timeout_s)
-            return proc.stdout
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
+        proc = subprocess.run(cmd, cwd=d, capture_output=True, text=True, timeout=exp.timeout_s)
+        return proc.stdout
 
+    _run.cwd = d  # exposed so callers/tests can confirm the cwd is stable across calls
     return _run
 
 

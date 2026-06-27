@@ -354,6 +354,73 @@ The adaptive validation **cost $3.27, ~6× the ~$0.5 estimate** — precisely be
 was unmeasured until this pass measured it ($0.005 assumed vs $0.063 real). The overrun is itself the
 evidence for why instrumenting spend mattered. Real spend then stopped pending direction.
 
+## v2.7 — warming the judge cache (2026-06-27)
+
+v2.5 left the biggest lever unbuilt: each judge call paid a **cold `cache_creation` (~7.5k tokens at
+$6/Mtok)** because the runner gave it a **fresh `mkdtemp` cwd every call**. A free diagnostic on the
+v2.5 data pinned the cause — per-call cold creation was flat (~7,470) whether an artifact was graded 2×
+or 5×, so even *identical-prompt* repeats stayed cold; the only thing differing across them was the cwd,
+which Claude Code embeds in its (cache-broken) system prompt. The fix: reuse **one stable, empty cwd**
+across all judge calls in a process ([`_temp_cwd_runner`](tokenbench/runner.py)). Isolation is
+unchanged (still a dedicated empty dir, no project `CLAUDE.md`; the judge writes no files; judging is
+sequential).
+
+**Controlled proof** (same judge prompt ×4, real `claude`, the *only* variable being the cwd):
+
+| call | OLD fresh-cwd: cache_creation / cost | NEW stable-cwd: cache_creation / cost |
+|---|---|---|
+| 0 | 7,079 / $0.0575 | 7,073 / $0.0577  (cold — first call, expected) |
+| 1 | 8,440 / $0.0868 | **0** / **$0.0162** |
+| 2 | 7,077 / $0.0581 | 1,301 / $0.0439  (partial re-warm) |
+| 3 | 7,075 / $0.0547 | **0** / **$0.0221** |
+
+**The cold creation collapses from ~7,000 to 0 on warm calls** — the cwd was the cache-buster, exactly
+as predicted. Per warm call is **~65–75% cheaper** ($0.063 → ~$0.016–0.022). The *aggregate* over this
+N=4 came out 46% because one unavoidable cold first call dominates a 4-call average; at batch scale only
+the **first** call of the process is cold, so the realized saving approaches the per-warm-call figure.
+Worked example — 20 artifacts × 5 samples = 100 calls: old ≈ 100×$0.063 = **$6.3**; new ≈ 1 cold +
+99 warm ≈ **~$2** (~68% off), and it **stacks with adaptive sampling** (v2.5, ~48% fewer calls) toward
+~$1. Cost of the proof itself: **$0.40** (under the $0.75 cap).
+
+Caveat (honest): server-side cache behavior has run-to-run noise — one warm call partially re-created
+(1,301 tokens) and one *old* call had an inflated read; the direction and magnitude are robust but it is
+not a flat 75% on every single call. An optional further lever (not built): a **fixed cross-run cwd
+path** so even the first call of a later batch is warm within the 1-hour cache TTL.
+
+## v2 follow-up — direct vs behavioral cost, decomposed (2026-06-27)
+
+v2 found that trimming the prescriptive convention made the costly arm *dearer* (+5.5%), but couldn't
+say how much was the **direct** effect (a smaller file = fewer tokens to re-read) vs the **behavioral**
+effect (the unconstrained model sprawls). The opt-in 3-arm `context-decompose` answers it by running all
+three context files in interleaved batches and using the middle arm (`lean`: small file, convention
+**kept**) as a behavior-held control. Pooled across batches, n=7–8/arm (input cost has tiny variance, so
+both legs separate easily):
+
+| leg | contrast | input cost | output | reading |
+|---|---|---|---|---|
+| **DIRECT** | verbose → lean (size cut, behavior held) | **+6.7% cheaper** (sig) | +15% | the file's own bytes |
+| **BEHAVIORAL** | lean → lean-costly (convention cut, ~same size) | **−13.9% dearer** (sig) | **+114% (sprawl)** | the model's changed behavior |
+| TOTAL | verbose → lean-costly | −6.3% dearer (n.s.) | — | the two legs nearly cancel |
+
+**The cost of cutting the convention is ~2× more behavioral than direct, and opposite in sign.** Trimming
+the file saves a little (+6.7%); removing the convention adds far more back (−13.9%) by making output
+**more than double** — so the net is *dearer*, and the convention's value is almost entirely in
+**constraining behavior**, not its own ~1k-token footprint. (The TOTAL is n.s. precisely because the two
+real, significant legs are similar magnitude and opposite sign, so the net sits near the noise floor —
+matching v2's modest +5.5%.)
+
+**Quality of the behavioral leg** (the analog question): at *matched small size*, does dropping the
+convention help or hurt? A blind pairwise (both A/B orders, length-robust) of `lean` vs `lean-costly`:
+**`lean-costly` preferred 7/7 (win-rate 1.00)**, with output 2.3× longer (1819 vs 806 tokens). So removing
+the convention costs more **and** yields output the judge robustly prefers — a real cost/quality tradeoff,
+now isolated from file size. Caveat: even position-controlled, one uncalibrated LLM may retain a residual
+preference for the longer/more-detailed answer, so read this as "the sprawl is not junk," not a calibrated
+quality gain.
+
+This closes the open v2 confound: the input-lever cost swing is **behavioral, not direct** — exactly the
+second-order effect a context-token counter is blind to. (Spend: ~$4.3 across the decompose runs +
+pairwise, under the $6 cap. Data pooled from `results/v2-context-decompose{,-judged}/`.)
+
 ## Limitations (non-negotiable to state)
 
 Single fixture, single machine, single model; n as shown. Two-sided Welch's t at α=0.05.
@@ -403,12 +470,16 @@ buys quality / structure buys efficiency" generalizes is untested.
   call**; added adaptive judge sampling (48% fewer calls, verdict direction held — a cost screen);
   confirmed tool-trim is safe-but-negligible; built the opt-in 3-arm `context-decompose` (stub-validated,
   `--confirm-spend`-gated). 78 tests.
-- **Biggest open efficiency lever:** **warm the judge cache** — judge calls run in fresh temp cwds and
-  re-pay ~7.5k cold `cache_creation` tokens each ($6/Mtok); a stable shared cwd or batched judging could
-  shift that toward `cache_read` ($0.30/Mtok), plausibly a bigger win than adaptive. Not yet built.
-- **v2 follow-ups (open):** *run* the gated `context-decompose` to separate the context's *direct* token
-  cost from its *behavioral* effect; test whether the filler↔quality / convention↔cost-discipline split
-  generalizes beyond one fixture/model.
+- **v2.7 judge-cache warming (done):** reused one stable cwd across judge calls — cold `cache_creation`
+  collapses ~7,000 → 0 on warm calls (~65–75% cheaper per warm call; ~68% at batch scale, stacking with
+  adaptive). Proven by a controlled same-prompt A/B for $0.40. Optional further lever: a fixed cross-run
+  cwd path to stay warm across batches within the 1-hour TTL.
+- **Direct-vs-behavioral decomposition (done):** ran the 3-arm `context-decompose` — cutting the
+  convention costs **−13.9% (behavioral, via +114% sprawl)** vs only **+6.7% (direct, file size)**, so the
+  input-lever cost swing is behavioral, not direct. At matched size the sprawl is also judged better
+  (pairwise 1.00). Closes the open v2 confound.
+- **v2 follow-ups (open):** test whether the filler↔quality / convention↔cost-discipline split
+  generalizes beyond one fixture/model (the v3 gate).
 - **v3:** package a proven technique as a Claude Code skill — but v2 shows the honest "technique"
   may be "keep a tight prescriptive convention" (it both constrains cost and is cheap), not "make
   the context short."
