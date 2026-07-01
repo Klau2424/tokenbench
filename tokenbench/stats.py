@@ -298,6 +298,171 @@ def bootstrap_ci(a: list[float], b: list[float],
     return {"point": stat(a, b), "lo": lo, "hi": hi, "level": 1.0 - alpha}
 
 
+# --- Tier 1: robust estimators, paired inference, multiplicity, proportions -------------
+#
+# Statistical-accuracy upgrades for our small, cache-noisy samples, each grounded in standard
+# practice:
+#  - IQM / median+IQR  : a robust center a single cold-cache spike cannot swing (rliable, Agarwal
+#                        et al. 2021), more efficient than the median.
+#  - paired-by-index + sign-flip permutation test : interleaved rounds share a cache/time context,
+#                        so pairing removes that between-round variance -> more power at the same n
+#                        (assumption-light; cf. the paired-bootstrap protocol for small effects).
+#  - BCa bootstrap CI  : bias-corrected & accelerated (Efron) -> correct coverage on skewed cost data
+#                        where the plain percentile interval is off.
+#  - Wilson interval   : correct small-n CI for a task-completion PROPORTION (vs the normal approx).
+#  - Holm / Benjamini-Hochberg : control error across a family of comparisons (we run many).
+#  - min detectable effect : what the current n could actually have caught, stated honestly.
+
+_NORM = statistics.NormalDist()
+
+
+def iqm(values: list[float]) -> float | None:
+    """Interquartile mean: the mean of the middle 50% (top/bottom quartiles dropped). Robust to a
+    single cold-cache outlier, more efficient than the median. n<4 falls back to the plain mean."""
+    xs = sorted(values)
+    n = len(xs)
+    if n == 0:
+        return None
+    if n < 4:
+        return statistics.mean(xs)
+    k = n // 4
+    mid = xs[k:n - k]
+    return statistics.mean(mid) if mid else statistics.mean(xs)
+
+
+def median_iqr(values: list[float]) -> dict:
+    """Median plus interquartile range (inclusive quantiles). A distribution-free spread that,
+    unlike sd, is not inflated by one heavy-tailed run."""
+    xs = sorted(values)
+    n = len(xs)
+    if n == 0:
+        return {"median": None, "iqr": None, "q1": None, "q3": None}
+    med = statistics.median(xs)
+    if n < 2:
+        return {"median": med, "iqr": 0.0, "q1": xs[0], "q3": xs[0]}
+    q1, _q2, q3 = statistics.quantiles(xs, n=4, method="inclusive")
+    return {"median": med, "iqr": q3 - q1, "q1": q1, "q3": q3}
+
+
+def bca_ci_1samp(values: list[float], statfn: Callable[[list[float]], float] = statistics.mean,
+                 n_resamples: int = 2000, alpha: float = 0.05, seed: int = 0) -> dict | None:
+    """Bias-corrected & accelerated (BCa) bootstrap CI for a one-sample statistic (Efron & Tibshirani).
+
+    Corrects the percentile interval for bias (z0, from where the point estimate falls in the
+    bootstrap distribution) and skew (a, from a jackknife). Right for our skewed cost/delta vectors.
+    Returns ``None`` for n<2; degenerates gracefully to a point when the statistic has no spread."""
+    xs = list(values)
+    n = len(xs)
+    if n < 2:
+        return None
+    theta = statfn(xs)
+    rng = random.Random(seed)
+    boot = sorted(statfn([xs[rng.randrange(n)] for _ in range(n)]) for _ in range(n_resamples))
+    prop = sum(1 for b in boot if b < theta) / n_resamples
+    if prop <= 0.0 or prop >= 1.0:  # all resamples on one side -> no usable bias correction
+        return {"point": theta, "lo": boot[0], "hi": boot[-1], "level": 1 - alpha, "method": "percentile-fallback"}
+    z0 = _NORM.inv_cdf(prop)
+    jack = [statfn(xs[:i] + xs[i + 1:]) for i in range(n)]
+    jbar = statistics.mean(jack)
+    denom = 6.0 * (sum((jbar - j) ** 2 for j in jack) ** 1.5)
+    a = (sum((jbar - j) ** 3 for j in jack) / denom) if denom else 0.0
+
+    def _adj(z: float) -> float:
+        return _NORM.cdf(z0 + (z0 + z) / (1 - a * (z0 + z)))
+
+    def _pick(p: float) -> float:
+        return boot[min(max(int(p * n_resamples), 0), n_resamples - 1)]
+
+    lo = _pick(_adj(_NORM.inv_cdf(alpha / 2)))
+    hi = _pick(_adj(_NORM.inv_cdf(1 - alpha / 2)))
+    return {"point": theta, "lo": lo, "hi": hi, "level": 1 - alpha, "method": "bca", "z0": z0, "a": a}
+
+
+def paired_by_index(base_recs: list[dict], treat_recs: list[dict], metric: str) -> list[tuple]:
+    """Pair base/treat records by ``run_index`` for one metric — interleaved rounds ran under the
+    same cache/time context, so index pairs are matched. Only indices present (and numeric) in
+    BOTH arms are kept, so a dropped artifact removes just its pair, not the whole analysis."""
+    def by_index(recs):
+        return {r["run_index"]: r[metric] for r in recs
+                if r.get("run_index") is not None and isinstance(r.get(metric), (int, float))}
+    b, t = by_index(base_recs), by_index(treat_recs)
+    return [(b[i], t[i]) for i in sorted(set(b) & set(t))]
+
+
+def sign_flip_test(deltas: list[float], n_perm: int = 20000, seed: int = 0) -> dict:
+    """Two-sided sign-flip permutation test that the mean paired delta is 0. Under H0 each delta's
+    sign is equally likely; assumption-light (no normality). Exact over all 2^n flips for n<=18,
+    else Monte Carlo. Returns p, n, and the observed mean delta."""
+    ds = list(deltas)
+    n = len(ds)
+    if n == 0:
+        return {"p": None, "n": 0, "mean_delta": None, "method": None}
+    obs = abs(statistics.mean(ds))
+    tol = 1e-12
+    if n <= 18:
+        count = 0
+        for mask in range(1 << n):
+            s = sum(ds[i] if (mask >> i) & 1 else -ds[i] for i in range(n))
+            count += abs(s) / n >= obs - tol
+        p, method = count / (1 << n), "exact"
+    else:
+        rng = random.Random(seed)
+        count = sum(abs(sum(d if rng.random() < 0.5 else -d for d in ds)) / n >= obs - tol
+                    for _ in range(n_perm))
+        p, method = count / n_perm, "montecarlo"
+    return {"p": p, "n": n, "mean_delta": statistics.mean(ds), "method": method}
+
+
+def wilson_ci(successes: int, n: int, alpha: float = 0.05) -> dict:
+    """Wilson score CI for a binomial proportion — correct at small n and extreme p, where the
+    normal approximation fails (e.g. our task-completion rate at n=5)."""
+    if n <= 0:
+        return {"phat": None, "lo": None, "hi": None, "n": 0}
+    z = _NORM.inv_cdf(1 - alpha / 2)
+    phat = successes / n
+    denom = 1 + z * z / n
+    center = (phat + z * z / (2 * n)) / denom
+    half = z * math.sqrt(phat * (1 - phat) / n + z * z / (4 * n * n)) / denom
+    return {"phat": phat, "lo": max(0.0, center - half), "hi": min(1.0, center + half), "n": n}
+
+
+def holm_bonferroni(pvalues: list[float], alpha: float = 0.05) -> list[dict]:
+    """Holm-Bonferroni step-down family-wise error control. Returns, in input order, each p with
+    its adjusted value and a reject flag at ``alpha``. Use across the family of tests in a report."""
+    m = len(pvalues)
+    order = sorted(range(m), key=lambda i: pvalues[i])
+    adj = [0.0] * m
+    running = 0.0
+    for rank, i in enumerate(order):
+        running = max(running, (m - rank) * pvalues[i])
+        adj[i] = min(1.0, running)
+    return [{"p": pvalues[i], "adjusted": adj[i], "reject": adj[i] <= alpha} for i in range(m)]
+
+
+def benjamini_hochberg(pvalues: list[float], alpha: float = 0.05) -> list[dict]:
+    """Benjamini-Hochberg FDR control. Returns, in input order, each p with its q-value (adjusted)
+    and a reject flag. Less conservative than Holm — right when we expect several real effects."""
+    m = len(pvalues)
+    order = sorted(range(m), key=lambda i: pvalues[i])
+    adj = [0.0] * m
+    prev = 1.0
+    for rank in range(m - 1, -1, -1):
+        i = order[rank]
+        prev = min(prev, pvalues[i] * m / (rank + 1))
+        adj[i] = min(1.0, prev)
+    return [{"p": pvalues[i], "adjusted": adj[i], "reject": adj[i] <= alpha} for i in range(m)]
+
+
+def min_detectable_effect_d(n: int, z_alpha: float = Z_ALPHA_TWO_SIDED_05,
+                            z_power: float = Z_POWER_80) -> float | None:
+    """Smallest Cohen's d a two-sample test at per-arm size ``n`` can detect at the given power —
+    the inverse of :func:`required_n_for_d`: ``d_min = (z_alpha + z_power)·sqrt(2/n)``. Stated up
+    front, it says honestly what an n=5 run could ever have caught."""
+    if n < 2:
+        return None
+    return (z_alpha + z_power) * math.sqrt(2.0 / n)
+
+
 def _present(records: Iterable[dict], key: str,
              transform: Callable[[float], float] | None = None) -> list[float]:
     """Values for ``key`` across records, skipping records that lack it (older data may
@@ -613,6 +778,119 @@ def format_report(comparison: dict) -> str:
 def report_from_file(path: str | Path, baseline: str, treatment: str,
                      primary_metric: str = PRIMARY_METRIC) -> str:
     return format_report(compare_arms(load_records(path), baseline, treatment, primary_metric))
+
+
+# --- Tier 1: the robust / paired analysis view ------------------------------------------
+
+def robust_analysis(records: list[dict], baseline: str, treatment: str,
+                    primary_metric: str = PRIMARY_METRIC) -> dict:
+    """Small-sample-honest view of a baseline->treatment comparison on ``primary_metric``.
+
+    Complements :func:`compare_arms` (mean + Welch t + percentile CI) with the tools that survive
+    n=5 cache noise: a robust center (IQM, median/IQR), a PAIRED sign-flip test over interleaved
+    ``run_index`` pairs (cache/time-matched) with a BCa CI on the paired delta, the minimum
+    detectable effect at this n, and task-completion rate with a Wilson CI. Reads the same records."""
+    all_arms = group_by_arm(records)               # includes invalid runs (for completion rate)
+    valid = group_by_arm(valid_records(records))
+    for arm in (baseline, treatment):
+        if arm not in valid:
+            raise ValueError(f"no valid records for arm {arm!r}")
+    base_recs, treat_recs = valid[baseline], valid[treatment]
+    for r in base_recs + treat_recs:
+        augment_record(r)
+
+    def center(recs: list[dict]) -> dict:
+        vals = [r[primary_metric] for r in recs]
+        return {"n": len(vals), "mean": statistics.mean(vals) if vals else None,
+                "iqm": iqm(vals), **median_iqr(vals)}
+
+    pairs = paired_by_index(base_recs, treat_recs, primary_metric)
+    deltas = [b - t for b, t in pairs]                       # positive == reduction
+    pct = [(b - t) / b * 100.0 for b, t in pairs if b]       # per-pair % reduction
+    paired = None
+    if deltas:
+        paired = {
+            "n_pairs": len(pairs),
+            "sign_flip": sign_flip_test(deltas),
+            "delta_ci": bca_ci_1samp(deltas, seed=0),
+            "pct_reduction_mean": statistics.mean(pct) if pct else None,
+            "pct_ci": bca_ci_1samp(pct, seed=0) if len(pct) >= 2 else None,
+        }
+
+    bvals = [r[primary_metric] for r in base_recs]
+    tvals = [r[primary_metric] for r in treat_recs]
+
+    def completion(arm: str):
+        typed = [r for r in all_arms.get(arm, []) if "artifact_text" in r]
+        if not typed:
+            return None
+        done = sum(1 for r in typed if r.get("valid") and r.get("artifact_text") is not None)
+        return {**wilson_ci(done, len(typed)), "completed": done, "attempted": len(typed)}
+
+    return {
+        "baseline": baseline, "treatment": treatment, "metric": primary_metric,
+        "is_cost": primary_metric in COST_METRICS,
+        "center": {baseline: center(base_recs), treatment: center(treat_recs)},
+        "paired": paired,
+        "welch": welch_ttest(bvals, tvals),                  # unpaired reference (shows pairing gain)
+        "mde_d": min_detectable_effect_d(min(len(base_recs), len(treat_recs))),
+        "completion": {baseline: completion(baseline), treatment: completion(treatment)},
+    }
+
+
+def _fmt_val(v: float | None, is_cost: bool) -> str:
+    if v is None:
+        return "n/a"
+    return f"${v:.5f}" if is_cost else f"{v:,.0f}"
+
+
+def format_robust_report(a: dict) -> str:
+    """Render :func:`robust_analysis` as a compact, honest text block."""
+    base, treat, metric = a["baseline"], a["treatment"], a["metric"]
+    is_cost = a["is_cost"]
+    cb, ct = a["center"][base], a["center"][treat]
+    L = []
+    L.append(f"tokenbench robust analysis  —  {base} vs {treat}  ({metric})")
+    L.append("=" * 82)
+    L.append(f"{'center':16}{base:>22}{treat:>22}")
+    L.append(f"{'  mean':16}{_fmt_val(cb['mean'], is_cost):>22}{_fmt_val(ct['mean'], is_cost):>22}")
+    L.append(f"{'  IQM (robust)':16}{_fmt_val(cb['iqm'], is_cost):>22}{_fmt_val(ct['iqm'], is_cost):>22}"
+             "   <- middle-50% mean; a cold-cache spike can't swing it")
+    L.append(f"{'  median':16}{_fmt_val(cb['median'], is_cost):>22}{_fmt_val(ct['median'], is_cost):>22}"
+             f"   [IQR {_fmt_val(cb['iqr'], is_cost)} / {_fmt_val(ct['iqr'], is_cost)}]")
+    p = a["paired"]
+    if p:
+        sf, dci, pci = p["sign_flip"], p["delta_ci"], p["pct_ci"]
+        L.append("")
+        L.append(f"paired (n={p['n_pairs']} by run_index — cache/time-matched):")
+        if dci:
+            L.append(f"  mean delta (reduction) = {_fmt_val(sf['mean_delta'], is_cost)}"
+                     f"   BCa 95% CI [{_fmt_val(dci['lo'], is_cost)}, {_fmt_val(dci['hi'], is_cost)}]")
+        if p["pct_reduction_mean"] is not None:
+            pc = f"   BCa 95% CI [{pci['lo']:+.1f}%, {pci['hi']:+.1f}%]" if pci else ""
+            L.append(f"  % reduction (per-pair)  = {p['pct_reduction_mean']:+.1f}%{pc}")
+        welch_p = a["welch"].get("p")
+        wtxt = f"{welch_p:.4f}" if welch_p is not None else "n/a"
+        L.append(f"  sign-flip p = {sf['p']:.4f} ({sf['method']})   vs unpaired Welch p = {wtxt}"
+                 "   <- pairing removes between-round cache/time variance")
+    mde = a["mde_d"]
+    if mde is not None:
+        L.append("")
+        L.append(f"minimum detectable effect at this n: Cohen's d >= {mde:.2f}"
+                 " (smaller true effects could not have been caught here)")
+    comp = a["completion"]
+    if comp[base] or comp[treat]:
+        def _c(x):
+            if not x:
+                return "n/a"
+            return f"{x['completed']}/{x['attempted']} = {x['phat']*100:.0f}% [Wilson {x['lo']*100:.0f}-{x['hi']*100:.0f}%]"
+        L.append("")
+        L.append(f"task completion (wrote the artifact):  {base} {_c(comp[base])}   {treat} {_c(comp[treat])}")
+    L.append("")
+    L.append("reading: IQM/median are outlier-robust; the paired sign-flip is the cache-matched "
+             "significance test (assumption-light); BCa CIs are skew-corrected. A wide MDE at small n "
+             "means 'not separated' = underpowered, not 'no effect'.")
+    return "\n".join(L)
 
 
 # --- pairwise (blind A/B) report ------------------------------------------------------------

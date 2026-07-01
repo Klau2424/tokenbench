@@ -278,3 +278,50 @@ caught), length-resistance (does not prefer the padded longer answer), and speci
   screen; **declined Opus** (Sonnet pairwise already maxed 100/100, so ~$3.5 saved). The gold set +
   `calibrate` are now a regression test for the instrument. Caveat: synthetic perturbations are cleaner
   than real subtle gaps; absolute sensitivity is tie-band-dependent; single fixture/domain.
+
+## Generalization — do the v2 findings replicate on a second fixture? (2026-07-01)
+
+Re-ran the 3-arm context trim on a **second, different-domain fixture** — CPython `Lib/statistics.py`
+@ v3.7.9 (`fixtures/statistics/`, 12 public symbols, numeric domain) — to test whether the v2 findings
+are real or a quirk of `inflection.py`. Re-themed `contexts/statistics/` variants with the NOTES
+convention copied **byte-for-byte** (tested). New `context-decompose-statistics` experiment; extended
+`pairwise_judge` + `pairwise --arms a,b` so one judged 3-arm run feeds any cross-arm contrast. +9 tests
+(now 99). 3 arms × n=5, judged with pairwise (the calibrated instrument); ~$2.8 total, under the $6 cap.
+
+- **F1 filler buys quality — REPLICATES:** verbose → lean is directionally cheaper (input +16.5%, n.s. at
+  n=5), coverage held 1.00, and blind **pairwise prefers verbose 5/5** (length-robust) — the filler
+  genuinely helped.
+- **F2 convention buys cost-discipline — REPLICATES:** decompose splits the trim into DIRECT (verbose →
+  lean, +16.5%, file cut) vs **BEHAVIORAL (lean → lean-costly, −8.4% dearer, sig, via +114.8% output
+  sprawl)** — nearly identical to inflection's +114%. New signal: **2/5 no-convention runs wrote no
+  `NOTES.md` at all** (compliance failure, not just sprawl).
+- **The exact v2 reversal — inconclusive:** verbose-vs-lean-costly had only 1/3 pairs decided (that one
+  preferred lean-costly), the rest lost to **unparseable judge replies** on the sprawling artifacts — a
+  logged instrument gap (pairwise preference is length-robust; its JSON output contract is not robust to
+  very long inputs). The failure only hits the no-convention arm, corroborating that dropping the
+  convention degrades output.
+
+**Verdict: 2 of 2 headline findings replicate on a different-domain fixture.** Caveat: one second fixture
+is a single replication (one model, one task type); broader generalization (more models/tasks) and a
+JSON-repair pass on the judge are the next levers. See [RESEARCH.md](RESEARCH.md).
+
+## Pairwise judge robustness + Tier-1 statistical hardening (2026-07-01)
+
+Two integrity passes after an instrument review against industry practice.
+
+- **Pairwise parse fix:** the judge is stochastic and occasionally returned a reply the parser couldn't
+  read — the old code *dropped that pair*, silently biasing the sample against the long (sprawly) arm.
+  `PairwiseJudgeScorer.compare` now **retries** (default 3), then **salvages** a verdict from a
+  truncated/prose reply (`_salvage_winner`, conservative — reads the explicit winner field or an
+  unambiguous tie, never guesses from praise), accumulating cost across attempts. +7 tests.
+- **Tier-1 robust/paired stats (`tokenbench robust`):** stdlib **IQM + median/IQR**, a **paired-by-run_index
+  sign-flip test** (cache/time-matched → removes between-round variance), **BCa** CIs, **Wilson** proportion
+  CIs (task completion), **Holm / Benjamini-Hochberg** (multiplicity), and **minimum detectable effect**. +10
+  tests. Debloat: removed the dead `Scorer` Protocol (codebase is otherwise ruff-clean). Suite 99 → **116**.
+- **Honest re-analysis (over all saved runs, $0):** it revised two of our own conclusions. (1) The
+  statistics "+16.5% free-trim saving" was a **cold-cache outlier** — IQM/median/paired all say **~7%**
+  (matching inflection). (2) *"Cutting the convention costs more on input-cost"* **fails the cache-matched
+  paired test** (inflection p=0.125, CI crosses 0; the earlier unpaired Welch p=0.0125 overstated it). What
+  holds: the **+114% output sprawl** (both fixtures) and reduced **task completion** (60% vs 100%, wide CIs).
+  Cross-cutting: **MDE d≥1.1–1.8 at n=5–8** — most "not separated" verdicts are underpowered, not null. See
+  [RESEARCH.md](RESEARCH.md).

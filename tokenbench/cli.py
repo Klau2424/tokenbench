@@ -153,6 +153,24 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_robust(args: argparse.Namespace) -> int:
+    # Tier-1 statistical-accuracy view: robust center (IQM/median), a cache-matched PAIRED sign-flip
+    # test with BCa CIs, minimum detectable effect, and task-completion (Wilson). Prefers the -judged
+    # dir (it carries artifact_text, needed for the completion rate); falls back to the plain runs.
+    exp = get_experiment(args.exp)
+    judged = replace(exp, id=exp.id + "-judged")
+    path = judged.runs_file() if judged.runs_file().exists() else exp.runs_file()
+    if not path.exists():
+        print(f"no runs at {path}; run `python -m tokenbench run --exp {args.exp}` first",
+              file=sys.stderr)
+        return 1
+    base = args.baseline or exp.arms[0].name
+    treat = args.treatment or exp.arms[1].name
+    analysis = stats.robust_analysis(stats.load_records(path), base, treat, exp.primary_metric)
+    print(stats.format_robust_report(analysis))
+    return 0
+
+
 def _cmd_report(args: argparse.Namespace) -> int:
     exp = get_experiment(args.exp)
     runs_path = exp.runs_file()
@@ -229,6 +247,14 @@ def main(argv: list[str] | None = None) -> int:
     p_cal.add_argument("--strong-model", default="opus",
                        help="model for the stronger-judge protocol (default: opus)")
     p_cal.set_defaults(func=_cmd_calibrate)
+
+    p_robust = sub.add_parser("robust",
+                              help="Tier-1 robust/paired stats: IQM, sign-flip, BCa CIs, MDE, completion")
+    p_robust.add_argument("--exp", choices=choices, default=DEFAULT_EXPERIMENT,
+                          help=f"which experiment's runs to analyze (default: {DEFAULT_EXPERIMENT})")
+    p_robust.add_argument("--baseline", default=None, help="baseline arm (default: first arm)")
+    p_robust.add_argument("--treatment", default=None, help="treatment arm (default: second arm)")
+    p_robust.set_defaults(func=_cmd_robust)
 
     p_report = sub.add_parser("report", help="re-print the report from saved runs")
     p_report.add_argument("--exp", choices=choices, default=DEFAULT_EXPERIMENT,

@@ -1,0 +1,4 @@
+{"summary": {"experiment": "v2-context-decompose-statistics-judged", "baseline_arm": "lean", "treatment_arm": "lean-costly", "n_pairs": 3, "n_decided": 0, "treatment_wins": 0, "baseline_wins": 0, "ties": 0, "treatment_win_rate": null, "base_mean_output": 713.8, "treat_mean_output": 1677.0, "judge_cost_usd": 0.0, "judge_calls": 0, "seed": 0}}
+{"pair_index": 0, "error": "ValueError: no JSON object in judge reply"}
+{"pair_index": 1, "error": "ValueError: no JSON object in judge reply"}
+{"pair_index": 2, "error": "ValueError: no JSON object in judge reply"}

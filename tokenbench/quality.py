@@ -18,7 +18,7 @@ import json
 import re
 import statistics
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Callable
 
 
 def public_symbols(py_path: str | Path) -> tuple[str, ...]:
@@ -36,12 +36,6 @@ def public_symbols(py_path: str | Path) -> tuple[str, ...]:
             if not node.name.startswith("_"):
                 names.append(node.name)
     return tuple(names)
-
-
-class Scorer(Protocol):
-    """Anything that turns an output artifact's text into a quality record."""
-
-    def score(self, artifact_text: str) -> dict: ...
 
 
 class CoverageScorer:
@@ -334,6 +328,23 @@ def _normalize_winner(raw) -> str:
     return "tie"
 
 
+def _salvage_winner(text: str) -> str | None:
+    """Recover a pairwise verdict from a reply that is not clean JSON — a *truncated* object that
+    still emitted the winner field, or an explicit tie in prose. Returns 'A'/'B'/'tie', or None if
+    there is no verdict signal at all. Used only after a real retry fails, so a stochastic malformed
+    reply is salvaged rather than silently dropping the pair. Deliberately conservative: it reads the
+    explicit ``winner`` field or an unambiguous tie word, and does NOT guess from free-form praise
+    (which would risk inventing a verdict)."""
+    t = str(text or "")
+    m = re.search(r'["\']?winner["\']?\s*[:=]\s*["\']?\s*(A|B|tie)\b', t, re.IGNORECASE)
+    if m:
+        return _normalize_winner(m.group(1))
+    if re.search(r"\b(tie|equivalent|equally (?:good|strong)|no preference|neither is better)\b",
+                 t, re.IGNORECASE):
+        return "tie"
+    return None
+
+
 class PairwiseJudgeScorer:
     """Blind pairwise quality judge — opt-in and token-costing, like :class:`JudgeScorer`.
 
@@ -349,11 +360,16 @@ class PairwiseJudgeScorer:
         runner: Callable[[list[str]], str] | None = None,
         base_cmd: tuple[str, ...] = ("claude",),
         model: str = JUDGE_MODEL,
+        max_attempts: int = 3,
     ):
         self.task_prompt = task_prompt
         self.runner = runner
         self.base_cmd = base_cmd
         self.model = model
+        # The judge is stochastic: on long answers it occasionally returns a reply the parser can't
+        # read, and the old code dropped that pair entirely — silently biasing the sample AGAINST the
+        # long (sprawly) arm we most want to measure. Retry the call, then salvage, before giving up.
+        self.max_attempts = max(1, max_attempts)
 
     def compare(self, answer_a: str, answer_b: str) -> dict:
         if self.runner is None:
@@ -361,12 +377,32 @@ class PairwiseJudgeScorer:
                 "PairwiseJudgeScorer needs an explicit runner to spend tokens on judging."
             )
         cmd = build_pairwise_command(answer_a, answer_b, self.task_prompt, self.base_cmd, self.model)
-        data = json.loads(self.runner(cmd))
-        cost = _envelope_cost(data)
-        inner = data.get("result", data) if isinstance(data, dict) else data
-        if isinstance(inner, str):
-            inner = _extract_score_json(inner)
-        return {"winner": _normalize_winner(inner.get("winner")), "reason": inner.get("reason"),
-                "cost_usd": cost["cost_usd"], "input_tokens": cost["input_tokens"],
-                "cache_read_tokens": cost["cache_read_tokens"],
-                "cache_creation_tokens": cost["cache_creation_tokens"]}
+        # Accumulate cost across attempts so recorded spend is honest even when we retry.
+        agg = {"cost_usd": 0.0, "input_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0}
+        last_reply = None
+        for _ in range(self.max_attempts):
+            data = json.loads(self.runner(cmd))
+            cost = _envelope_cost(data)
+            for k in agg:
+                agg[k] += cost[k] or 0
+            inner = data.get("result", data) if isinstance(data, dict) else data
+            if not isinstance(inner, str):  # already-structured reply (e.g. a dict) — parse directly
+                return self._verdict(_normalize_winner(inner.get("winner")), inner.get("reason"), agg)
+            last_reply = inner
+            try:
+                parsed = _extract_score_json(inner)
+            except (ValueError, json.JSONDecodeError):
+                continue  # malformed this time — retry (the judge is stochastic)
+            return self._verdict(_normalize_winner(parsed.get("winner")), parsed.get("reason"), agg)
+        # Retries exhausted: salvage a verdict from the last reply rather than drop the pair.
+        salvaged = _salvage_winner(last_reply or "")
+        if salvaged is not None:
+            return self._verdict(salvaged, "salvaged from unparseable judge reply", agg, salvaged=True)
+        raise ValueError(f"no JSON object in judge reply after {self.max_attempts} attempts")
+
+    @staticmethod
+    def _verdict(winner: str, reason, agg: dict, salvaged: bool = False) -> dict:
+        return {"winner": winner, "reason": reason, "salvaged": salvaged,
+                "cost_usd": agg["cost_usd"], "input_tokens": agg["input_tokens"],
+                "cache_read_tokens": agg["cache_read_tokens"],
+                "cache_creation_tokens": agg["cache_creation_tokens"]}

@@ -162,6 +162,9 @@ python -m tokenbench pairwise --exp context-costly  # blind A/B re-judge of save
 python -m tokenbench budget --exp context-lean      # spend breakdown: task cache vs output vs judge
 python -m tokenbench run --exp context-decompose --confirm-spend  # opt-in 3-arm direct-vs-behavioral cost split
 python -m tokenbench decompose --exp context-decompose            # print the 3-arm decomposition report
+python -m tokenbench run --exp context-decompose-statistics --confirm-spend  # generalization: same trim on a 2nd fixture
+python -m tokenbench pairwise --exp context-decompose-statistics --arms verbose,lean-costly  # any cross-arm pairwise contrast
+python -m tokenbench robust --exp context-decompose-statistics  # Tier-1 robust/paired stats (IQM, sign-flip, BCa, MDE, completion)
 python -m tokenbench calibrate --dry-run    # $0 self-test: harness flags the length-biased stub judge
 python -m tokenbench calibrate              # characterize the judge vs a synthetic gold set (sensitivity + length-resistance)
 ```
@@ -182,14 +185,16 @@ python -m tokenbench report --exp explain
 pytest
 ```
 
-90 tests covering stats math (Welch t-test, known critical values, Cohen's d, required-n,
+99 tests covering stats math (Welch t-test, known critical values, Cohen's d, required-n,
 bootstrap CIs), the cache-aware decomposition (`input_cost_usd` + the reported-cost checksum,
 configurable primary metric), the coverage and LLM-judge quality scorers (multi-sample averaging,
 adaptive early-stop, captured judge spend, graceful failure, $0 stub), the blind pairwise judge
-(winner parsing, both-orders position-bias cancellation, $0 stub), the spend breakdown and 3-arm
-cost decomposition, the multi-arm `--confirm-spend` gate, the judge-calibration harness (synthetic
-perturbations, sensitivity/length-resistance metrics, detecting a length-biased stub), runner parsing,
-standing-context injection, replication accumulation, and artifact re-judging.
+(winner parsing, both-orders position-bias cancellation, explicit arm-pair selection, $0 stub), the
+spend breakdown and 3-arm cost decomposition, the multi-arm `--confirm-spend` gate, the
+judge-calibration harness (synthetic perturbations, sensitivity/length-resistance metrics, detecting
+a length-biased stub), the second-fixture generalization scaffolding (byte-identical NOTES convention
+across fixtures, re-themed filler), runner parsing, standing-context injection, replication
+accumulation, and artifact re-judging.
 
 ---
 
@@ -289,9 +294,16 @@ constraints, every experiment run, honest account of what worked and what didn't
   misses fine completeness/accuracy losses (33%). Adopted pairwise as the primary signal, absolute as a
   coarse screen; the gold set is now a regression test (`tokenbench calibrate`). Full write-up in
   [`RESEARCH.md`](RESEARCH.md).
-- **v3 (intent)** — package a proven technique as a Claude Code skill. v2's twist: the honest
-  technique is task-dependent — "keep a tight, prescriptive convention" buys cost-discipline, but on
-  open-ended tasks that brevity can cost quality, so "make the context short" is not free either way.
+- **Generalization (measured — 1 second fixture)** — re-ran the 3-arm trim on a different-domain fixture
+  (`statistics.py`) to test replicate-vs-flip. **Both headline findings replicate:** filler buys quality
+  (verbose preferred **5/5** in length-robust pairwise) and cutting the convention costs more via
+  **+114.8% output sprawl** (nearly identical to inflection's +114%), plus **2/5 no-convention runs wrote
+  no file at all**. The exact v2 *reversal* is inconclusive here — the sprawling no-convention artifacts
+  broke the pairwise judge's JSON parse, a logged instrument gap. Holds on two fixtures, one model/task.
+  Full write-up in [`RESEARCH.md`](RESEARCH.md).
+- **v3 (intent)** — package a proven technique as a Claude Code skill. The honest technique, now holding
+  on two fixtures, is **"keep a tight, prescriptive convention"** — it buys cost-discipline *and* quality;
+  "make the context short" is not free either way. Do NOT ship until it provides real value.
 
 ---
 
