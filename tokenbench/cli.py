@@ -111,6 +111,39 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    # Calibrate the judge against the synthetic gold set: which protocol best catches real defects
+    # and resists length bias. Dry-run uses the (deliberately length-biased) stub for a $0 self-test.
+    import json
+
+    from . import calibration
+    from .runner import STUB, _temp_cwd_runner
+
+    exp = get_experiment("explain")  # task = explain inflection.py; also supplies the judge timeout
+    base_cmd = [sys.executable, str(STUB)] if args.dry_run else ["claude"]
+    runner = _temp_cwd_runner(exp)
+    protocols = calibration.default_protocols(strong_model=args.strong_model)
+    if args.protocols:
+        wanted = set(args.protocols.split(","))
+        protocols = [p for p in protocols if p.name in wanted]
+        if not protocols:
+            print(f"no protocols match {args.protocols!r}; choices: "
+                  f"{', '.join(p.name for p in calibration.default_protocols())}", file=sys.stderr)
+            return 1
+    mode = "DRY (stub, $0)" if args.dry_run else "REAL (judge tokens; may include a stronger model)"
+    print(f"== judge calibration : {mode} ==", flush=True)
+    result = calibration.run_calibration(exp.prompt, runner, tuple(base_cmd), protocols=protocols,
+                                         samples=args.samples, band=args.band)
+    outdir = exp.results_dir / ("judge-calibration-dryrun" if args.dry_run else "judge-calibration")
+    outdir.mkdir(parents=True, exist_ok=True)
+    with open(outdir / "calibration.jsonl", "w", encoding="utf-8") as fh:
+        for name, p in result["protocols"].items():
+            fh.write(json.dumps({"protocol": name, "metrics": p["metrics"], "rows": p["rows"]}) + "\n")
+    print()
+    print(calibration.format_calibration_report(result))
+    return 0
+
+
 def _cmd_report(args: argparse.Namespace) -> int:
     exp = get_experiment(args.exp)
     runs_path = exp.runs_file()
@@ -170,6 +203,20 @@ def main(argv: list[str] | None = None) -> int:
                             help=f"which experiment's judged artifacts to compare (default: {DEFAULT_EXPERIMENT})")
     p_pairwise.add_argument("--dry-run", action="store_true", help="use the stub claude ($0)")
     p_pairwise.set_defaults(func=_cmd_pairwise)
+
+    p_cal = sub.add_parser("calibrate",
+                           help="characterize the judge against a synthetic gold set (sensitivity + length-resistance)")
+    p_cal.add_argument("--dry-run", action="store_true",
+                       help="use the length-biased stub ($0) — the harness should flag it as length-biased")
+    p_cal.add_argument("--samples", type=int, default=1,
+                       help="grades per absolute-judge call to average (default 1)")
+    p_cal.add_argument("--band", type=float, default=1.0,
+                       help="tie-band for absolute protocols: |score delta| <= band => equivalent (default 1.0)")
+    p_cal.add_argument("--protocols", default=None,
+                       help="comma-separated subset of protocol names to run (default: all)")
+    p_cal.add_argument("--strong-model", default="opus",
+                       help="model for the stronger-judge protocol (default: opus)")
+    p_cal.set_defaults(func=_cmd_calibrate)
 
     p_report = sub.add_parser("report", help="re-print the report from saved runs")
     p_report.add_argument("--exp", choices=choices, default=DEFAULT_EXPERIMENT,

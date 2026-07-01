@@ -97,16 +97,60 @@ JUDGE_PROMPT_TEMPLATE = (
 )
 
 
+# --- alternative judging protocols (compared by the calibration harness) ------------------
+#
+# Each protocol is just a different prompt template (+ how its reply maps to a 0-10 score). They
+# all flow through JudgeScorer via its `prompt_template` / `score_fn` params, so the spend capture,
+# sampling, and parsing are shared. Markers let the dry-run stub recognize each call.
+
+JUDGE_RUBRIC_MARKER = "TOKENBENCH-RUBRIC-v1"
+JUDGE_RUBRIC_TEMPLATE = (
+    "You are grading an answer. " + JUDGE_RUBRIC_MARKER + "\n"
+    "An assistant was given the TASK below and produced the ANSWER below. Score each dimension on a "
+    "0-10 scale, judging content and NOT length (a longer answer is not automatically better): "
+    "completeness (covers what the TASK asks for), accuracy (no false statements), usefulness (clear "
+    "and correct). Reply with ONLY a JSON object and nothing else: "
+    '{{"completeness": <0-10>, "accuracy": <0-10>, "usefulness": <0-10>, "reason": "<one sentence>"}}.'
+    "\n\nTASK:\n{task}\n\nANSWER:\n{artifact}\n"
+)
+
+JUDGE_REFERENCE_MARKER = "TOKENBENCH-REF-v1"
+JUDGE_REFERENCE_TEMPLATE = (
+    "You are grading an answer against a reference. " + JUDGE_REFERENCE_MARKER + "\n"
+    "The REFERENCE is a high-quality answer to the TASK. Grade the ANSWER on a 0-10 scale: 10 means "
+    "it matches the reference's completeness and accuracy (or is better); score lower when it omits "
+    "content the reference covers or states something false. Judge content, NOT length. Reply with "
+    'ONLY a JSON object and nothing else: {{"score": <0-10>, "reason": "<one sentence>"}}.\n\n'
+    "TASK:\n{task}\n\nREFERENCE:\n{reference}\n\nANSWER:\n{artifact}\n"
+)
+
+
+def _default_score(inner: dict) -> float:
+    return float(inner["score"])
+
+
+def _rubric_score(inner: dict) -> float:
+    """Aggregate a rubric reply (completeness/accuracy/usefulness) into one 0-10 score in code —
+    averaging the dimensions ourselves rather than trusting the model to, which also dampens the
+    length halo a single gestalt score carries."""
+    dims = [inner.get(k) for k in ("completeness", "accuracy", "usefulness")]
+    vals = [float(d) for d in dims if d is not None]
+    return sum(vals) / len(vals) if vals else float(inner.get("score", 0.0))
+
+
 def build_judge_command(
     artifact_text: str,
     task_prompt: str,
     base_cmd: tuple[str, ...] = ("claude",),
     model: str = JUDGE_MODEL,
+    template: str = JUDGE_PROMPT_TEMPLATE,
+    **fields: str,
 ) -> list[str]:
     """Build the headless command that scores an artifact with an LLM judge, grading it
     against ``task_prompt``. ``base_cmd`` is the binary prefix (``("claude",)`` for real
-    judging, the stub for dry runs)."""
-    prompt = JUDGE_PROMPT_TEMPLATE.format(task=task_prompt, artifact=artifact_text)
+    judging, the stub for dry runs). ``template`` + ``fields`` select the protocol (e.g. a
+    reference-based template also takes ``reference=...``)."""
+    prompt = template.format(task=task_prompt, artifact=artifact_text, **fields)
     return list(base_cmd) + ["-p", prompt, "--output-format", "json", "--model", model]
 
 
@@ -171,6 +215,9 @@ class JudgeScorer:
         adaptive: bool = False,
         min_samples: int = 2,
         sd_threshold: float = 0.75,
+        prompt_template: str = JUDGE_PROMPT_TEMPLATE,
+        template_fields: dict | None = None,
+        score_fn: Callable[[dict], float] = _default_score,
     ):
         self.task_prompt = task_prompt
         self.runner = runner
@@ -180,6 +227,11 @@ class JudgeScorer:
         self.adaptive = adaptive
         self.min_samples = max(1, min_samples)
         self.sd_threshold = sd_threshold
+        # Protocol selection: the prompt template, any extra template fields (e.g. a reference
+        # answer), and how to turn the reply dict into a 0-10 score. Defaults = today's absolute judge.
+        self.prompt_template = prompt_template
+        self.template_fields = template_fields or {}
+        self.score_fn = score_fn
 
     def _one_score(self, cmd: list[str]) -> tuple[float, str | None, dict]:
         data = json.loads(self.runner(cmd))
@@ -187,7 +239,7 @@ class JudgeScorer:
         inner = data.get("result", data) if isinstance(data, dict) else data
         if isinstance(inner, str):
             inner = _extract_score_json(inner)
-        raw = max(0.0, min(10.0, float(inner["score"])))
+        raw = max(0.0, min(10.0, self.score_fn(inner)))
         return raw, inner.get("reason"), cost
 
     def score(self, artifact_text: str) -> dict:
@@ -195,7 +247,8 @@ class JudgeScorer:
             raise RuntimeError(
                 "JudgeScorer needs an explicit runner to spend tokens on judging."
             )
-        cmd = build_judge_command(artifact_text, self.task_prompt, self.base_cmd, self.model)
+        cmd = build_judge_command(artifact_text, self.task_prompt, self.base_cmd, self.model,
+                                  template=self.prompt_template, **self.template_fields)
         scores: list[float] = []
         reasons: list[str | None] = []
         spend = {"judge_cost_usd": 0.0, "judge_input_tokens": 0, "judge_output_tokens": 0,

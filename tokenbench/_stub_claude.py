@@ -29,17 +29,30 @@ def _public_names() -> list[str]:
     ]
 
 
+def _len_score(text: str) -> float:
+    """A deliberately LENGTH-BIASED score (0-10) — longer answer scores higher, scaled so a typical
+    answer lands mid-range (not clamped). The stub is a knowingly-biased judge so the calibration
+    harness can (a) be validated at $0 and (b) be shown to *detect* length bias (low length-resistance
+    on the padded gold cases)."""
+    return round(max(0.0, min(10.0, len(text) / 450.0)), 2)
+
+
 def _emit_judge(argv, rng) -> int:
-    """Answer a judge call ($0): score by how many '## symbol' sections the answer has, so
-    the verbose baseline artifact scores higher than the terse one — exercising the judge
-    path end-to-end without spending tokens."""
+    """Answer an absolute / rubric / reference judge call ($0) as a length-biased judge.
+
+    The reply shape is chosen by the protocol marker in the prompt; the score is driven by the
+    ANSWER's length (longer -> higher), so this stub is fooled by the padded gold-set cases."""
     try:
         prompt = argv[argv.index("-p") + 1]
     except (ValueError, IndexError):
         prompt = ""
-    answer = prompt.split("ANSWER:", 1)[-1]
-    score = max(1, min(10, answer.count("## ") + rng.randint(-1, 1)))
-    inner = json.dumps({"score": score, "reason": "stub judge: scored by section count"})
+    answer = prompt.rsplit("ANSWER:", 1)[-1]   # the graded answer (last ANSWER: section)
+    s = _len_score(answer)
+    if "TOKENBENCH-RUBRIC" in prompt:
+        inner = json.dumps({"completeness": s, "accuracy": s, "usefulness": s,
+                            "reason": "stub: length-biased rubric"})
+    else:  # absolute or reference-based — both reply with {"score": ...}
+        inner = json.dumps({"score": s, "reason": "stub: length-biased score"})
     result = {
         "type": "result", "subtype": "success", "is_error": False, "num_turns": 1,
         "duration_ms": 800 + rng.randint(-100, 100),
@@ -54,17 +67,17 @@ def _emit_judge(argv, rng) -> int:
 
 
 def _emit_pairwise(argv, rng) -> int:
-    """Answer a pairwise judge call ($0): pick the answer with more '## symbol' sections as the
-    winner (a quality proxy), tie when equal. Exercises the blind-pairwise path without tokens."""
+    """Answer a pairwise judge call ($0) as a length-biased judge: the LONGER answer wins, tie when
+    near-equal length. Lets the harness detect that the stub is fooled by length."""
     try:
         prompt = argv[argv.index("-p") + 1]
     except (ValueError, IndexError):
         prompt = ""
     a = prompt.split("ANSWER A:", 1)[-1].split("ANSWER B:", 1)[0]
     b = prompt.split("ANSWER B:", 1)[-1]
-    na, nb = a.count("## "), b.count("## ")
-    winner = "A" if na > nb else "B" if nb > na else "tie"
-    inner = json.dumps({"winner": winner, "reason": "stub pairwise: more sections wins"})
+    la, lb = len(a), len(b)
+    winner = "A" if la > lb * 1.1 else "B" if lb > la * 1.1 else "tie"
+    inner = json.dumps({"winner": winner, "reason": "stub pairwise: longer answer wins"})
     result = {
         "type": "result", "subtype": "success", "is_error": False, "num_turns": 1,
         "duration_ms": 800 + rng.randint(-100, 100),
@@ -90,8 +103,9 @@ def main() -> int:
     joined = " ".join(argv)
     if "TOKENBENCH-PAIRWISE" in joined:
         return _emit_pairwise(argv, rng)
-    # Judge calls carry the judge marker in their -p prompt; answer them and stop.
-    if "TOKENBENCH-JUDGE" in joined:
+    # Absolute / rubric / reference judge calls each carry their own marker; all answered as the
+    # length-biased stub judge.
+    if any(m in joined for m in ("TOKENBENCH-JUDGE", "TOKENBENCH-RUBRIC", "TOKENBENCH-REF")):
         return _emit_judge(argv, rng)
 
     # Baseline writes a verbose NOTES.md; terse writes a shorter one.

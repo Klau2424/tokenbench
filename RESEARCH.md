@@ -421,6 +421,46 @@ This closes the open v2 confound: the input-lever cost swing is **behavioral, no
 second-order effect a context-token counter is blind to. (Spend: ~$4.3 across the decompose runs +
 pairwise, under the $6 cap. Data pooled from `results/v2-context-decompose{,-judged}/`.)
 
+## Hardening the judge — calibration against synthetic ground truth (2026-06-28)
+
+Before scaling spend on per-task rules, we characterized the quality instrument itself. No human labels:
+build **synthetic ground truth** by perturbing a frozen good answer in *known* ways and measure which
+judging *protocol* (a) catches the defects and (b) resists length. Perturbations: omit a function /
+inject a false statement / truncate (DEFECT → should score lower) vs pad length ~2× / reformat (NEUTRAL
+→ should not change). Metrics: **sensitivity** (defects caught), **length-resistance** (does *not* prefer
+the padded longer answer), **specificity** (neutrals called equivalent). On-thesis — measure the ruler
+with a ruler. The dry-run stub is a deliberately length-biased judge, and the harness correctly flags it
+(len-resistance 0%) at $0 — a built-in self-test.
+
+Real run (~$3.4, 9 gold cases; `tokenbench calibrate`):
+
+| protocol | sensitivity | length-resistance | specificity | accuracy |
+|---|---|---|---|---|
+| absolute 0-10 (Sonnet) | 33% | 100% | 67% | 44% |
+| reference-based | 17% | 100% | 67% | 33% |
+| rubric (dimensional) | 33% | 100% | 0% | 22% |
+| **pairwise (both orders)** | **100%** | **100%** | 0%¹ | 67% |
+
+**Pairwise is the calibrated instrument** — the only protocol that catches *every* defect while
+resisting length. The absolute/rubric/reference judges all **miss fine completeness/accuracy losses**
+(17-33%): a single omitted function or a same-length injected error moves the 0-10 score by less than the
+tie-band, so it reads as "equivalent." The split is principled, a sensitivity/specificity trade governed
+by how a protocol declares ties: the absolute judge *ties within its band* (high specificity, misses
+small defects); pairwise is *forced to choose* (catches everything, rarely ties). **For ranking two arms
+— our actual use — forced choice is exactly right**, which is why pairwise was already our de-confound
+backstop; calibration now gives that a measured basis.
+
+¹ Pairwise's 0% specificity is it preferring the clean reference over the *padded / reformatted* variants
+rather than calling them a tie — defensible (redundant padding is mild bloat), and harmless for ranking.
+
+Decisions and honest caveats: **adopt pairwise as the primary quality signal; treat the absolute 0-10 as
+a cheap coarse screen** (sensitivity ~33%, useful only for gross differences). We **declined the Opus
+protocol** — Sonnet pairwise already maxed the two decisive metrics (100/100), so a stronger model could
+not improve them (~$3.5 saved). Caveats: synthetic perturbations are cleaner than real subtle quality
+gaps; the absolute judge's sensitivity is **band-dependent** (a smaller tie-band would raise it but admit
+neutral noise — a knob, not calibrated here); single fixture/domain. The gold set + `calibrate` now stand
+as a **regression test** for the instrument.
+
 ## Limitations (non-negotiable to state)
 
 Single fixture, single machine, single model; n as shown. Two-sided Welch's t at α=0.05.
@@ -478,8 +518,11 @@ buys quality / structure buys efficiency" generalizes is untested.
   convention costs **−13.9% (behavioral, via +114% sprawl)** vs only **+6.7% (direct, file size)**, so the
   input-lever cost swing is behavioral, not direct. At matched size the sprawl is also judged better
   (pairwise 1.00). Closes the open v2 confound.
-- **v2 follow-ups (open):** test whether the filler↔quality / convention↔cost-discipline split
-  generalizes beyond one fixture/model (the v3 gate).
+- **Judge hardening (done):** calibrated the quality instrument against a synthetic gold set —
+  **pairwise** catches 100% of defects and resists length 100%, while the absolute 0-10 judge misses
+  fine losses (33%). Adopted pairwise as the primary signal; the gold set is now a regression test.
+- **Generalization (open — next):** test whether the filler↔quality / convention↔cost-discipline split
+  holds beyond one fixture/model (the v3 gate). Now safe to run with a calibrated judge.
 - **v3:** package a proven technique as a Claude Code skill — but v2 shows the honest "technique"
   may be "keep a tight prescriptive convention" (it both constrains cost and is cheap), not "make
   the context short."

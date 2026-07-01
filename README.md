@@ -162,6 +162,8 @@ python -m tokenbench pairwise --exp context-costly  # blind A/B re-judge of save
 python -m tokenbench budget --exp context-lean      # spend breakdown: task cache vs output vs judge
 python -m tokenbench run --exp context-decompose --confirm-spend  # opt-in 3-arm direct-vs-behavioral cost split
 python -m tokenbench decompose --exp context-decompose            # print the 3-arm decomposition report
+python -m tokenbench calibrate --dry-run    # $0 self-test: harness flags the length-biased stub judge
+python -m tokenbench calibrate              # characterize the judge vs a synthetic gold set (sensitivity + length-resistance)
 ```
 
 Writes to `results/<experiment>/runs.jsonl`. Each run costs ~$0.10–$0.12. Runs **accumulate**
@@ -180,13 +182,14 @@ python -m tokenbench report --exp explain
 pytest
 ```
 
-79 tests covering stats math (Welch t-test, known critical values, Cohen's d, required-n,
+90 tests covering stats math (Welch t-test, known critical values, Cohen's d, required-n,
 bootstrap CIs), the cache-aware decomposition (`input_cost_usd` + the reported-cost checksum,
 configurable primary metric), the coverage and LLM-judge quality scorers (multi-sample averaging,
 adaptive early-stop, captured judge spend, graceful failure, $0 stub), the blind pairwise judge
 (winner parsing, both-orders position-bias cancellation, $0 stub), the spend breakdown and 3-arm
-cost decomposition, the multi-arm `--confirm-spend` gate, runner parsing, standing-context injection,
-replication accumulation, and artifact re-judging.
+cost decomposition, the multi-arm `--confirm-spend` gate, the judge-calibration harness (synthetic
+perturbations, sensitivity/length-resistance metrics, detecting a length-biased stub), runner parsing,
+standing-context injection, replication accumulation, and artifact re-judging.
 
 ---
 
@@ -280,6 +283,12 @@ constraints, every experiment run, honest account of what worked and what didn't
   block collapse **~7,000 → 0** on warm calls — a controlled same-prompt A/B showed **~65–75% off per
   warm call** (~68% at batch scale, stacking with adaptive sampling), proven for $0.40. Caveat: the
   server cache has run-to-run noise. Full write-up in [`RESEARCH.md`](RESEARCH.md).
+- **Judge calibration (measured)** — before scaling spend, characterized the quality instrument against
+  a synthetic gold set (perturb a good answer in known ways; measure which protocol catches defects and
+  resists length). **Pairwise wins: 100% sensitivity, 100% length-resistance**; the absolute 0-10 judge
+  misses fine completeness/accuracy losses (33%). Adopted pairwise as the primary signal, absolute as a
+  coarse screen; the gold set is now a regression test (`tokenbench calibrate`). Full write-up in
+  [`RESEARCH.md`](RESEARCH.md).
 - **v3 (intent)** — package a proven technique as a Claude Code skill. v2's twist: the honest
   technique is task-dependent — "keep a tight, prescriptive convention" buys cost-discipline, but on
   open-ended tasks that brevity can cost quality, so "make the context short" is not free either way.

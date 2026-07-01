@@ -257,3 +257,24 @@ file (direct) vs the model sprawling (behavioral). Pooled n=7–8/arm (~$4.3 of 
 - **Process note:** an accidental concurrent run split data across the `-judged` (judged) and plain
   (task-only) dirs — no corruption, no waste (rows pooled for analysis); the cost decomposition is
   judge-independent so pooling is valid.
+
+## Judge calibration — harden the quality instrument (2026-06-28)
+
+Calibrated the judge against **synthetic ground truth** before scaling spend on per-task rules. New
+`tokenbench/calibration.py`: a frozen reference answer perturbed in known ways (omit a function / inject
+a false claim / truncate → DEFECT; pad length ~2× / reformat → NEUTRAL), scored by sensitivity (defects
+caught), length-resistance (does not prefer the padded longer answer), and specificity. Parameterized
+`JudgeScorer` with `prompt_template`/`score_fn` (no fork) to add rubric + reference-based protocols;
+`tokenbench calibrate [--dry-run] [--protocols …]`. +11 tests (now 90).
+
+- **Self-test ($0):** the dry-run stub is a deliberately length-biased judge, and the harness flags it
+  (length-resistance 0%) — proving it detects the bias it hunts.
+- **Real (~$3.4, 9 gold cases):** **pairwise wins — 100% sensitivity, 100% length-resistance.** The
+  absolute 0-10 / reference / rubric judges all miss fine completeness/accuracy losses (17–33%): a single
+  omission or same-length error moves the score less than the tie-band → "equivalent." Principled
+  sensitivity/specificity trade (ties-within-band vs forced-choice); for ranking two arms, pairwise's
+  forced choice is right.
+- **Decisions:** adopt **pairwise as the primary quality signal**, absolute 0-10 as a coarse cheap
+  screen; **declined Opus** (Sonnet pairwise already maxed 100/100, so ~$3.5 saved). The gold set +
+  `calibrate` are now a regression test for the instrument. Caveat: synthetic perturbations are cleaner
+  than real subtle gaps; absolute sensitivity is tie-band-dependent; single fixture/domain.
