@@ -463,6 +463,39 @@ def min_detectable_effect_d(n: int, z_alpha: float = Z_ALPHA_TWO_SIDED_05,
     return (z_alpha + z_power) * math.sqrt(2.0 / n)
 
 
+def cuped_adjust(y: list[float], x: list[float], groups: list | None = None) -> dict | None:
+    """CUPED variance reduction (Deng et al. 2013): remove the covariate-predicted part of Y.
+
+    ``Y_adj = Y - theta*(X - Xbar)`` with ``theta = Cov(Y,X)/Var(X)``. Because X is centered, the
+    mean of Y is preserved (estimates stay UNBIASED) while variance falls ~``(1 - rho^2)``.
+
+    Pass ``groups`` (a per-point label, e.g. the arm) to center X and Y **within group**. That is
+    the right choice when the covariate's *level* is itself correlated with the group — here the
+    warm-up cost depends on the arm's ``CLAUDE.md`` size — so within-group centering keeps each
+    group mean (and their difference) unbiased while still stripping the within-group nuisance
+    variance the covariate explains. Returns adjusted Y plus theta, rho, and the variance reduction."""
+    n = len(y)
+    if n < 2 or len(x) != n:
+        return None
+    labels = groups if groups is not None else [0] * n
+    idx: dict = {}
+    for i, g in enumerate(labels):
+        idx.setdefault(g, []).append(i)
+    gx = {g: statistics.mean(x[i] for i in ii) for g, ii in idx.items()}
+    gy = {g: statistics.mean(y[i] for i in ii) for g, ii in idx.items()}
+    xc = [x[i] - gx[labels[i]] for i in range(n)]           # within-group-centered covariate
+    yc = [y[i] - gy[labels[i]] for i in range(n)]
+    vx = statistics.variance(xc)
+    if vx == 0:
+        return {"adjusted": list(y), "theta": 0.0, "rho": 0.0, "var_reduction": 0.0}
+    cov = sum(a * b for a, b in zip(yc, xc)) / (n - 1)
+    theta = cov / vx
+    adjusted = [y[i] - theta * xc[i] for i in range(n)]      # xc is zero-mean per group -> means kept
+    vy = statistics.variance(yc)
+    rho = cov / math.sqrt(vx * vy) if vy > 0 else 0.0
+    return {"adjusted": adjusted, "theta": theta, "rho": rho, "var_reduction": rho * rho}
+
+
 def _present(records: Iterable[dict], key: str,
              transform: Callable[[float], float] | None = None) -> list[float]:
     """Values for ``key`` across records, skipping records that lack it (older data may
@@ -783,7 +816,8 @@ def report_from_file(path: str | Path, baseline: str, treatment: str,
 # --- Tier 1: the robust / paired analysis view ------------------------------------------
 
 def robust_analysis(records: list[dict], baseline: str, treatment: str,
-                    primary_metric: str = PRIMARY_METRIC) -> dict:
+                    primary_metric: str = PRIMARY_METRIC,
+                    covariate: str = "warmup_cost_usd") -> dict:
     """Small-sample-honest view of a baseline->treatment comparison on ``primary_metric``.
 
     Complements :func:`compare_arms` (mean + Welch t + percentile CI) with the tools that survive
@@ -820,6 +854,32 @@ def robust_analysis(records: list[dict], baseline: str, treatment: str,
     bvals = [r[primary_metric] for r in base_recs]
     tvals = [r[primary_metric] for r in treat_recs]
 
+    # CUPED: if runs carry the warm-up covariate, regress it out (within-arm centered so the arm
+    # difference stays unbiased) and re-run the paired test on the variance-reduced metric.
+    cuped = None
+    cov_recs = [r for r in base_recs + treat_recs
+                if isinstance(r.get(covariate), (int, float))
+                and isinstance(r.get(primary_metric), (int, float))]
+    if len(cov_recs) >= 4 and len({r["arm"] for r in cov_recs}) == 2:
+        ys = [r[primary_metric] for r in cov_recs]
+        xs = [r[covariate] for r in cov_recs]
+        gs = [r["arm"] for r in cov_recs]
+        adj = cuped_adjust(ys, xs, groups=gs)
+        if adj:
+            akey = {(r["arm"], r["run_index"]): v for r, v in zip(cov_recs, adj["adjusted"])}
+            b_adj = {ri: v for (arm, ri), v in akey.items() if arm == baseline}
+            t_adj = {ri: v for (arm, ri), v in akey.items() if arm == treatment}
+            common = sorted(set(b_adj) & set(t_adj))
+            adj_deltas = [b_adj[i] - t_adj[i] for i in common]
+            raw_bvar = statistics.variance([r[primary_metric] for r in base_recs
+                                            if r["arm"] == baseline]) if len(base_recs) > 1 else None
+            cuped = {
+                "covariate": covariate, "rho": adj["rho"], "var_reduction": adj["var_reduction"],
+                "theta": adj["theta"], "n_used": len(cov_recs),
+                "paired_sign_flip": sign_flip_test(adj_deltas) if adj_deltas else None,
+                "paired_delta_ci": bca_ci_1samp(adj_deltas, seed=0) if len(adj_deltas) >= 2 else None,
+            }
+
     def completion(arm: str):
         typed = [r for r in all_arms.get(arm, []) if "artifact_text" in r]
         if not typed:
@@ -832,6 +892,7 @@ def robust_analysis(records: list[dict], baseline: str, treatment: str,
         "is_cost": primary_metric in COST_METRICS,
         "center": {baseline: center(base_recs), treatment: center(treat_recs)},
         "paired": paired,
+        "cuped": cuped,
         "welch": welch_ttest(bvals, tvals),                  # unpaired reference (shows pairing gain)
         "mde_d": min_detectable_effect_d(min(len(base_recs), len(treat_recs))),
         "completion": {baseline: completion(baseline), treatment: completion(treatment)},
@@ -873,6 +934,17 @@ def format_robust_report(a: dict) -> str:
         wtxt = f"{welch_p:.4f}" if welch_p is not None else "n/a"
         L.append(f"  sign-flip p = {sf['p']:.4f} ({sf['method']})   vs unpaired Welch p = {wtxt}"
                  "   <- pairing removes between-round cache/time variance")
+    cu = a.get("cuped")
+    if cu:
+        L.append("")
+        L.append(f"CUPED (covariate = {cu['covariate']}, warm-up cost):")
+        L.append(f"  variance reduction = {cu['var_reduction'] * 100:.0f}%  (rho={cu['rho']:+.2f}, "
+                 f"n={cu['n_used']}) <- residual cache noise regressed out")
+        sf, ci = cu.get("paired_sign_flip"), cu.get("paired_delta_ci")
+        if sf and ci:
+            L.append(f"  adjusted paired: mean delta {_fmt_val(sf['mean_delta'], is_cost)}"
+                     f"  BCa 95% CI [{_fmt_val(ci['lo'], is_cost)}, {_fmt_val(ci['hi'], is_cost)}]"
+                     f"  sign-flip p={sf['p']:.4f}")
     mde = a["mde_d"]
     if mde is not None:
         L.append("")

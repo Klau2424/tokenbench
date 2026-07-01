@@ -203,8 +203,37 @@ def score_judge(rec: dict, judge_scorer, artifact_text: str) -> None:
         rec["judge_error"] = f"{type(e).__name__}: {e}"[:200]
 
 
+# Tier-2 warm-up: a throwaway call carrying this marker, run in the measured run's own workdir
+# with no tools, so it pays the cold front-matter cache (system prompt + cwd + CLAUDE.md +
+# append_system_prompt) and the measured call that follows reads it WARM. Its own usage is the
+# CUPED covariate for that run. The marker lets the $0 stub recognise it.
+WARMUP_PROMPT = "TOKENBENCH-WARMUP: reply with the single word ready. Use no tools."
+
+
+def _warmup(base_cmd: list[str], exp: Experiment, arm: Arm, workdir: Path) -> dict:
+    """Pre-create the front-matter cache in ``workdir`` and return the warm-up's own usage as the
+    CUPED covariate. Uses the SAME model + append_system_prompt (so the cached prefix matches the
+    measured call) but no tools and a trivial prompt (so it's cheap). Failures are swallowed —
+    a warm-up must never fail the run; it only forfeits the covariate."""
+    cmd = build_command(base_cmd, WARMUP_PROMPT, exp.model, "",
+                        append_system_prompt=arm.append_system_prompt, bare=exp.bare)
+    try:
+        proc = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=exp.timeout_s)
+        w = parse_result(proc.stdout, proc.returncode)
+    except subprocess.TimeoutExpired:
+        w = {"valid": False}
+    return {
+        "warmup_valid": bool(w.get("valid")),
+        "warmup_cost_usd": w.get("total_cost_usd"),
+        "warmup_cache_creation_tokens": w.get("cache_creation_tokens"),
+        "warmup_cache_read_tokens": w.get("cache_read_tokens"),
+        "warmup_input_tokens": w.get("input_tokens"),
+        "warmup_output_tokens": w.get("output_tokens"),
+    }
+
+
 def run_once(exp: Experiment, arm: Arm, run_index: int, base_cmd: list[str],
-             batch_id: str | None = None, judge=None) -> dict:
+             batch_id: str | None = None, judge=None, warmup: bool = False) -> dict:
     """Execute a single headless run in an isolated temp copy of the fixture.
 
     Each run gets a fresh copy of the fixture under the system temp dir (outside the dev
@@ -229,6 +258,9 @@ def run_once(exp: Experiment, arm: Arm, run_index: int, base_cmd: list[str],
         # variable under test. Still a *known* controlled file — no parent-dir CLAUDE.md leaks in.
         if arm.context is not None:
             (workdir / "CLAUDE.md").write_text(arm.context, encoding="utf-8")
+        # Tier-2: warm the front-matter cache in THIS workdir first, so the measured call below reads
+        # it warm (kills the cold/warm coin-flip that dominated cost variance). Its usage = covariate.
+        warm = _warmup(base_cmd, exp, arm, workdir) if warmup else None
         try:
             proc = subprocess.run(
                 cmd, cwd=workdir, capture_output=True, text=True, timeout=exp.timeout_s,
@@ -254,6 +286,8 @@ def run_once(exp: Experiment, arm: Arm, run_index: int, base_cmd: list[str],
         config_hash=config_hash(exp, arm),
         batch_id=batch_id,
     )
+    if warm is not None:
+        rec.update(warm)
     return rec
 
 
@@ -453,7 +487,7 @@ def pairwise_judge(exp: Experiment, base_cmd: list[str] | None = None, dry_run: 
 
 def run_experiment(exp: Experiment, base_cmd: list[str] | None = None,
                    dry_run: bool = False, fresh: bool = False, judge: bool = False,
-                   judge_samples: int = 1) -> Path:
+                   judge_samples: int = 1, warmup: bool = False) -> Path:
     """Run all arms, interleaved, appending each record to ``runs.jsonl`` as it completes.
 
     Interleaving (round-robin over arms within each repetition) spreads any time-correlated
@@ -480,7 +514,8 @@ def run_experiment(exp: Experiment, base_cmd: list[str] | None = None,
     with open(runs_path, "a", encoding="utf-8") as fh:
         for i in range(exp.n):
             for arm in exp.arms:
-                rec = run_once(exp, arm, i, base_cmd, batch_id=batch_id, judge=judge_scorer)
+                rec = run_once(exp, arm, i, base_cmd, batch_id=batch_id, judge=judge_scorer,
+                               warmup=warmup)
                 rec["batch_started"] = batch_started.isoformat()
                 fh.write(json.dumps(rec) + "\n")
                 fh.flush()

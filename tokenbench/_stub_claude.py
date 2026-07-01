@@ -91,9 +91,38 @@ def _emit_pairwise(argv, rng) -> int:
     return 0
 
 
+def _emit_warmup(rng) -> int:
+    """Answer a warm-up call ($0): a cheap 1-turn reply that pays the cold front-matter cache
+    (cache_creation scaled by the CLAUDE.md size, like a real cold load) and writes NO artifact.
+    Its usage is the CUPED covariate for the measured run that follows in the same cwd."""
+    ctx_tokens = 0
+    try:
+        ctx_tokens = len(open("CLAUDE.md", encoding="utf-8").read()) // 4
+    except OSError:
+        pass
+    cache_creation = 4000 + ctx_tokens + rng.randint(-100, 100)   # cold front-matter load
+    cache_read = 300 + rng.randint(-50, 50)                       # ~nothing re-read on 1 turn
+    input_tokens = 40 + rng.randint(-5, 5)
+    output_tokens = 5 + rng.randint(0, 3)
+    cost = input_tokens * 3e-6 + output_tokens * 15e-6 + cache_read * 0.3e-6 + cache_creation * 6e-6
+    result = {
+        "type": "result", "subtype": "success", "is_error": False, "num_turns": 1,
+        "duration_ms": 800 + rng.randint(-100, 100), "session_id": f"stub-warm-{os.getpid()}",
+        "result": "ready", "total_cost_usd": round(cost, 6),
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens,
+                  "cache_read_input_tokens": cache_read, "cache_creation_input_tokens": cache_creation},
+        "modelUsage": {"claude-sonnet-4-6": {"inputTokens": input_tokens}},
+    }
+    print(json.dumps(result))
+    return 0
+
+
 def main() -> int:
     argv = sys.argv[1:]
     is_treatment = "--append-system-prompt" in argv
+
+    if "TOKENBENCH-WARMUP" in " ".join(argv):
+        return _emit_warmup(random.Random(os.getpid()))
 
     # Deterministic-ish jitter keyed to PID so repeated dry runs vary a little.
     rng = random.Random(os.getpid())

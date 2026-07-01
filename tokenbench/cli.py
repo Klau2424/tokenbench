@@ -36,7 +36,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     accum = "fresh file" if args.fresh else "appending (accumulate replications)"
     print(f"== tokenbench {exp.id} : {mode} : {exp.n} per arm : {accum} ==")
     runs_path = run_experiment(exp, dry_run=args.dry_run, fresh=args.fresh, judge=args.judge,
-                               judge_samples=args.judge_samples)
+                               judge_samples=args.judge_samples, warmup=args.warmup)
     print(f"\nwrote {runs_path}\n")
     base, treat = exp.arms[0].name, exp.arms[1].name
     print(stats.report_from_file(runs_path, base, treat, exp.primary_metric))
@@ -202,6 +202,9 @@ def main(argv: list[str] | None = None) -> int:
                        help="LLM grades per artifact to average when --judge (default 3)")
     p_run.add_argument("--confirm-spend", action="store_true",
                        help="required to run a heavy multi-arm experiment (e.g. context-decompose) for real")
+    p_run.add_argument("--warmup", action="store_true",
+                       help="Tier-2: run a throwaway warm-up call per run to warm the cache (kills the "
+                            "cold/warm cost confound); its usage is captured as the CUPED covariate")
     p_run.set_defaults(func=_cmd_run)
 
     p_judge = sub.add_parser("judge", help="re-score saved artifacts with an averaged LLM judge")

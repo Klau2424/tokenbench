@@ -554,6 +554,39 @@ the cheap fix (it turned the statistics free-trim from Welch p=0.19 into paired 
 Everything here is directional at small n; the honest headline metric is the **robust center + the paired
 sign-flip**, not the mean or the unpaired t.
 
+## Tier-2 — killing the cache-state confound at the source (2026-07-01, live-validated)
+
+Tier-1 made us robust *to* the cache confound; Tier-2 *removes* it, so the mean stops lying in the first
+place. Two mechanisms, both grounded in online-experiment practice (CUPED — Deng et al. 2013):
+
+- **Warm-up turn** (`run --warmup`): before each measured run, a throwaway 1-turn call (no tools) runs in
+  that run's workdir so it pays the cold front-matter `cache_creation`, and the measured call reads it
+  **warm**. The cold/warm coin-flip becomes a constant. Its own usage is captured as the CUPED covariate.
+- **CUPED** (within-arm centered, so the arm difference stays unbiased even though warm-up cost tracks the
+  arm's `CLAUDE.md` size): regresses that covariate out of the metric, cutting residual variance ~(1−ρ²).
+
+**Live A/B (context-lean, n=6, OFF vs ON):**
+
+| arm | metric | OFF sd | ON sd | change |
+|---|---|---|---|---|
+| verbose (the variance-prone arm) | cache_creation | 4,710 | 68 | **−99%** |
+| verbose | input_cost_usd | $0.02685 | $0.00039 | **−99%** |
+| lean (already stable) | input_cost_usd | $0.00011 | $0.00081 | slightly worse, both negligible |
+
+Warm-up **collapsed the verbose arm's cost variance by 99%** — the exact cold-cache swing (one run at
+$0.184 vs ~$0.117) that inflated our 7%→16.5% is gone. The warmed free-trim delta reads a clean **+6.2%
+[5.6%, 6.7%]** *directly* — matching inflection's true 6.7% with no robust-estimator heroics.
+
+Honest nuances: (1) warm-up warms only the ~7,000-token front matter (= the warm-up's own
+`cache_creation`), not the file-read portion the measured run creates — so it kills the *variable* part,
+not all creation (verbose measured `cache_creation` mean 15,469→13,530). (2) On an already-stable arm it
+*adds* trivial noise — it is not free insurance; warm it when an arm is variance-prone (heavy context),
+skip it for cheap screens. (3) **CUPED added only 3% on the warmed data** (ρ=−0.18): warm-up already
+removed the variance CUPED would have exploited, so warm-up is the workhorse and CUPED a mop-up (most
+useful as the $0 alternative when a covariate exists but you did not warm up). (4) Cost: ~$0.046/run
+overhead (the warm-up call). Net recommendation: **`--warmup` for headline measurements on heavy-context
+arms; the robust/paired stats (Tier-1) remain the default read.**
+
 ## Limitations (non-negotiable to state)
 
 Single fixture, single machine, single model; n as shown. Two-sided Welch's t at α=0.05.

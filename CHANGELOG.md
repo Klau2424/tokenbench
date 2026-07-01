@@ -305,6 +305,29 @@ convention copied **byte-for-byte** (tested). New `context-decompose-statistics`
 is a single replication (one model, one task type); broader generalization (more models/tasks) and a
 JSON-repair pass on the judge are the next levers. See [RESEARCH.md](RESEARCH.md).
 
+## Tier-2 — controlling the cache-state confound at the source (2026-07-01, live-validated)
+
+Tier-1 made us *robust to* the cache-state confound; Tier-2 *removes it*. **Live A/B (context-lean,
+n=6, warm-up OFF vs ON) proved it:** the verbose arm's cost variance — the exact cold-cache swing that
+inflated our 7%→16.5% — collapsed **−99%** (cache_creation sd 4,710→68; input_cost sd $0.0269→$0.0004),
+and the warmed free-trim delta read a clean **+6.2% [5.6%, 6.7%]** directly. Honest nuances: warm-up warms
+only the ~7k-token front matter (not the file read), so it kills the *variable* part not all creation; on
+an already-stable arm it adds trivial noise (not free insurance); **CUPED added only 3% on the warmed data**
+(warm-up already removed the variance it would exploit — so warm-up is the workhorse, CUPED a mop-up); cost
+~$0.046/run overhead.
+
+- **Warm-up turn** (`run --warmup`): before each measured run, a throwaway 1-turn call (marker
+  `TOKENBENCH-WARMUP`, no tools) runs in the same workdir so it pays the cold front-matter
+  cache_creation and the measured call reads it **warm** — turning the cold/warm coin-flip (which
+  inflated a 7% saving to 16.5%) into a constant. The warm-up's own usage is captured as covariate
+  fields (`warmup_cost_usd`, etc.). Stub-supported (`_emit_warmup`) so it's $0-testable.
+- **CUPED** (`stats.cuped_adjust`, wired into `robust`): regresses the warm-up covariate out of the
+  primary metric — **within-arm centered** so the arm difference stays unbiased even though warm-up
+  cost tracks the arm's CLAUDE.md size — cutting residual variance by ~(1 − rho²). Reports variance
+  reduction and the adjusted paired CI.
+- **Validated live** (see the −99% headline above); the $0 stub path (`_emit_warmup`) keeps it
+  self-testable. +5 tests (now 121). See [RESEARCH.md](RESEARCH.md).
+
 ## Pairwise judge robustness + Tier-1 statistical hardening (2026-07-01)
 
 Two integrity passes after an instrument review against industry practice.

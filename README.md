@@ -164,6 +164,7 @@ python -m tokenbench run --exp context-decompose --confirm-spend  # opt-in 3-arm
 python -m tokenbench decompose --exp context-decompose            # print the 3-arm decomposition report
 python -m tokenbench run --exp context-decompose-statistics --confirm-spend  # generalization: same trim on a 2nd fixture
 python -m tokenbench pairwise --exp context-decompose-statistics --arms verbose,lean-costly  # any cross-arm pairwise contrast
+python -m tokenbench run --exp context-lean --warmup    # Tier-2: warm the cache per run (kills the cold/warm cost confound)
 python -m tokenbench robust --exp context-decompose-statistics  # Tier-1 robust/paired stats (IQM, sign-flip, BCa, MDE, completion)
 python -m tokenbench calibrate --dry-run    # $0 self-test: harness flags the length-biased stub judge
 python -m tokenbench calibrate              # characterize the judge vs a synthetic gold set (sensitivity + length-resistance)
