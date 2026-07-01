@@ -340,7 +340,7 @@ def _arm_artifacts(records: list[dict], arm: str) -> list[dict]:
 
 
 def pairwise_judge(exp: Experiment, base_cmd: list[str] | None = None, dry_run: bool = False,
-                   seed: int = 0) -> dict:
+                   seed: int = 0, base_arm: str | None = None, treat_arm: str | None = None) -> dict:
     """Blind pairwise re-judge of an experiment's saved artifacts (judge tokens only).
 
     De-confounds the absolute judge's length bias: instead of grading each artifact alone (where
@@ -357,7 +357,15 @@ def pairwise_judge(exp: Experiment, base_cmd: list[str] | None = None, dry_run: 
     scorer = quality.PairwiseJudgeScorer(exp.prompt, runner=_temp_cwd_runner(exp),
                                          base_cmd=tuple(base_cmd))
 
-    base_arm, treat_arm = exp.arms[0].name, exp.arms[1].name  # verbose (baseline) vs lean (treatment)
+    # Default pair = arms[0] vs arms[1] (verbose vs lean). An explicit pair lets one judged 3-arm
+    # run feed any cross-arm contrast (e.g. verbose vs lean-costly — the one that reversed on v2).
+    arm_names = {a.name for a in exp.arms}
+    base_arm = base_arm or exp.arms[0].name
+    treat_arm = treat_arm or exp.arms[1].name
+    if base_arm not in arm_names or treat_arm not in arm_names:
+        raise ValueError(f"arms {base_arm!r}/{treat_arm!r} not in experiment arms {sorted(arm_names)}")
+    if base_arm == treat_arm:
+        raise ValueError(f"pairwise needs two distinct arms, got {base_arm!r} twice")
     records = stats.load_records(exp.runs_file())
     base_rows = _arm_artifacts(records, base_arm)
     treat_rows = _arm_artifacts(records, treat_arm)
@@ -430,7 +438,11 @@ def pairwise_judge(exp: Experiment, base_cmd: list[str] | None = None, dry_run: 
 
     out_dir = exp.results_dir / (exp.id + "-pairwise")
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "pairwise.jsonl"
+    # Default pair keeps the historical filename; a non-default pair gets its own file so multiple
+    # contrasts from the same run don't clobber each other.
+    is_default_pair = base_arm == exp.arms[0].name and treat_arm == exp.arms[1].name
+    fname = "pairwise.jsonl" if is_default_pair else f"pairwise-{base_arm}-vs-{treat_arm}.jsonl"
+    out_path = out_dir / fname
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(json.dumps({"summary": summary}) + "\n")
         for d in decisions:

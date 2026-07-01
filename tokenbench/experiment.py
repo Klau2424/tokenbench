@@ -77,6 +77,50 @@ def _public_api() -> tuple[str, ...]:
     return quality.public_symbols(FIXTURE_SOURCE)
 
 
+@dataclass(frozen=True)
+class Fixture:
+    """A vendored code module the v2 context lever runs against.
+
+    The v2 experiments were all measured on ``inflection``; the generalization test re-runs the
+    same three-way context trim on a *second* fixture (``statistics``) to check whether the findings
+    replicate or flip. A fixture bundles its source dir, its per-fixture context variants
+    (``contexts/<name>/`` — the verbose/lean/lean-costly CLAUDE.md set, whose load-bearing NOTES
+    convention is byte-identical across fixtures), and its explain-prompt task.
+
+    ``context_subdir=None`` uses the flat ``contexts/*.md`` (inflection's original layout, kept
+    unchanged for reproducibility); a named subdir uses ``contexts/<subdir>/*.md``.
+    """
+    name: str
+    dir: Path
+    source: Path
+    prompt_task: str
+    context_subdir: str | None = None
+    id_suffix: str = ""   # appended to experiment ids; empty for the original inflection ids
+
+    def context(self, variant: str) -> str:
+        sub = (ROOT / "contexts" / self.context_subdir) if self.context_subdir else (ROOT / "contexts")
+        return (sub / f"{variant}.md").read_text(encoding="utf-8")
+
+    def public_api(self) -> tuple[str, ...]:
+        return quality.public_symbols(self.source)
+
+    def prompt(self) -> str:
+        return _prompt(self.prompt_task)
+
+
+# The original v2 fixture — flat contexts/, no id suffix (its published ids must not change).
+INFLECTION = Fixture("inflection", FIXTURE_DIR, FIXTURE_SOURCE, "context-explain")
+# The generalization fixture — a different (numeric) domain; its own contexts/ subdir + id suffix.
+STATISTICS = Fixture(
+    "statistics",
+    ROOT / "fixtures" / "statistics",
+    ROOT / "fixtures" / "statistics" / "statistics.py",
+    "context-explain-statistics",
+    context_subdir="statistics",
+    id_suffix="-statistics",
+)
+
+
 # --- treatment rules (the single variable under test, per task) -------------------------
 
 # Free-form task: a blunt word cap. Forces a large, low-variance gap against an open-ended
@@ -192,7 +236,7 @@ def context_costly_experiment() -> Experiment:
     )
 
 
-def context_decompose_experiment() -> Experiment:
+def context_decompose_experiment(fixture: Fixture = INFLECTION) -> Experiment:
     """v2.5: a **3-arm** experiment that splits the costly-trim cost into *direct* vs *behavioral*.
 
     Cutting the convention cost +5.5%, but we couldn't tell how much was the smaller file (direct)
@@ -203,21 +247,26 @@ def context_decompose_experiment() -> Experiment:
       - ``verbose -> lean-costly``: the total (should ≈ compose of the two).
     Reuses the three existing context files — no new context. **Heavy** (3 arms x n), so it is opt-in:
     the CLI refuses to run it for real without an explicit ``--confirm-spend`` flag.
+
+    ``fixture`` selects the codebase: ``INFLECTION`` (the original, id ``v2-context-decompose``) or
+    ``STATISTICS`` (the generalization fixture, id ``v2-context-decompose-statistics``). The three
+    context variants carry the same byte-identical NOTES convention across fixtures, so the only
+    thing that changes across fixtures is the module under explanation.
     """
     return Experiment(
-        id="v2-context-decompose",
-        fixture_dir=FIXTURE_DIR,
-        prompt=_prompt("context-explain"),
+        id="v2-context-decompose" + fixture.id_suffix,
+        fixture_dir=fixture.dir,
+        prompt=fixture.prompt(),
         model="sonnet",
         allowed_tools="Read,Write",
         arms=[
-            Arm(name="verbose", context=_context("verbose")),         # big + convention
-            Arm(name="lean", context=_context("lean")),               # small + convention
-            Arm(name="lean-costly", context=_context("lean-costly")),  # small, no convention
+            Arm(name="verbose", context=fixture.context("verbose")),         # big + convention
+            Arm(name="lean", context=fixture.context("lean")),               # small + convention
+            Arm(name="lean-costly", context=fixture.context("lean-costly")),  # small, no convention
         ],
         n=5,
         primary_metric="input_cost_usd",
-        expected_symbols=_public_api(),
+        expected_symbols=fixture.public_api(),
     )
 
 
@@ -229,6 +278,7 @@ EXPERIMENTS = {
     "context-lean": context_lean_experiment,
     "context-costly": context_costly_experiment,
     "context-decompose": context_decompose_experiment,
+    "context-decompose-statistics": lambda: context_decompose_experiment(STATISTICS),
 }
 
 DEFAULT_EXPERIMENT = "explain"

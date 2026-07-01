@@ -85,9 +85,18 @@ def _cmd_pairwise(args: argparse.Namespace) -> int:
         print(f"no judged runs at {exp.runs_file()}; run "
               f"`python -m tokenbench run --judge --exp {args.exp}` first", file=sys.stderr)
         return 1
+    base_arm = treat_arm = None
+    if args.arms:
+        parts = [s.strip() for s in args.arms.split(",")]
+        if len(parts) != 2:
+            print(f"--arms expects exactly two comma-separated arm names, got {args.arms!r}",
+                  file=sys.stderr)
+            return 1
+        base_arm, treat_arm = parts
     mode = "DRY RUN (stub, $0)" if args.dry_run else "REAL (judge tokens only)"
-    print(f"== pairwise re-judge {exp.id} : {mode} ==")
-    summary = pairwise_judge(exp, dry_run=args.dry_run)
+    pair = f" [{base_arm} vs {treat_arm}]" if args.arms else ""
+    print(f"== pairwise re-judge {exp.id}{pair} : {mode} ==")
+    summary = pairwise_judge(exp, dry_run=args.dry_run, base_arm=base_arm, treat_arm=treat_arm)
     print()
     print(stats.format_pairwise_report(summary))
     return 0
@@ -202,6 +211,9 @@ def main(argv: list[str] | None = None) -> int:
     p_pairwise.add_argument("--exp", choices=choices, default=DEFAULT_EXPERIMENT,
                             help=f"which experiment's judged artifacts to compare (default: {DEFAULT_EXPERIMENT})")
     p_pairwise.add_argument("--dry-run", action="store_true", help="use the stub claude ($0)")
+    p_pairwise.add_argument("--arms", default=None,
+                            help="explicit 'base,treat' arm pair to compare (default: the first two arms); "
+                                 "e.g. --arms verbose,lean-costly for a 3-arm decompose")
     p_pairwise.set_defaults(func=_cmd_pairwise)
 
     p_cal = sub.add_parser("calibrate",

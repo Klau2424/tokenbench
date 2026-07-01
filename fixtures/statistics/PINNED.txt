@@ -1,0 +1,7 @@
+python/cpython @ v3.7.9
+Lib/statistics.py
+https://github.com/python/cpython/blob/v3.7.9/Lib/statistics.py
+
+Licensed under the PSF License Agreement (see LICENSE).
+Vendored unmodified as a second benchmark fixture (numeric domain) for the
+generalization test — a different-domain counterpart to fixtures/inflection.
