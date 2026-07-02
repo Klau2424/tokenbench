@@ -587,6 +587,29 @@ useful as the $0 alternative when a covariate exists but you did not warm up). (
 overhead (the warm-up call). Net recommendation: **`--warmup` for headline measurements on heavy-context
 arms; the robust/paired stats (Tier-1) remain the default read.**
 
+## Tier-3 — the metrics we weren't capturing + the first human anchor (2026-07-01)
+
+The third review axis is *metrics*, not stats (Tier 1) or confounds (Tier 2). We built the two parts that
+close a real gap and deferred the rest (faithfulness, Bradley–Terry, mixed-effects) on purpose.
+
+- **$0 judge-reliability diagnostics** (Phase A): `pairwise` now reports **swap-consistency** (do the two
+  A/B orders agree — the standard position-bias check), a standing **longer-answer win-rate** (verbosity),
+  and the **salvage rate**; `robust` reports **latency p50/p95/p99, tokens/s, tail (p95) cost** per arm.
+- **Human anchor** (Phase B, `tokenbench/anchor.py`, `anchor sample`/`score`): the judge was validated
+  only against *synthetic* perturbations; this measures agreement with a **human on real artifacts** —
+  sample blinded real pairs, hand-label a winner, re-judge both orders, report **Cohen's κ**.
+
+**First anchor result — context-costly, 8 hand-labeled pairs (verbose vs the no-convention arm):**
+judge-vs-human **raw agreement 5/8 (62%), κ = +0.25 ("fair", below the 0.6 trust bar).** On this subtle,
+both-long contrast the pairwise judge is a **weak proxy** for human preference — which is *consistent* with
+the "no preference" pairwise verdicts we already saw there (the two answers genuinely are close). Honest
+scoping: n=8 with a single labeler is a very wide interval, so this is a **caution flag, not a verdict**; it
+does **not** bear on gross differences (calibration showed 100% sensitivity on clear defects) or on the
+**judge-independent** findings (the +114% sprawl and the task-completion failures are behavioral, not
+judged). **Takeaway:** trust the pairwise judge for *direction on clear contrasts*, treat it as a *screen*
+on subtle ones, and lean on human labels for any headline quality claim on a close call. A firmer κ (and one
+on the *free-trim* contrast, where differences are clearer) needs more labels — the tooling is now in place.
+
 ## Limitations (non-negotiable to state)
 
 Single fixture, single machine, single model; n as shown. Two-sided Welch's t at α=0.05.

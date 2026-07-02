@@ -318,9 +318,14 @@ the rest (Bradley-Terry, faithfulness, mixed-effects) is scoped-and-deferred on 
   only against *synthetic* perturbations; this measures whether it agrees with a **human on real
   artifacts**. `sample` pulls blinded real pairs and writes a fill-in `.md` sheet ($0); `score` re-judges
   them (both orders, position-cancelled) and reports **Cohen's κ** (`stats.cohens_kappa`) vs your labels.
-- +12 tests (now 128). **Pending:** you label ~8–12 pairs, then `anchor score` (~$1) gives the first
-  non-synthetic judge validation. Deferred: a faithfulness/correctness metric (needs its own calibration).
-  See [RESEARCH.md](RESEARCH.md).
+- +12 tests (now 128). Deferred: a faithfulness/correctness metric (needs its own calibration).
+- **First human-anchor result (context-costly, 8 hand-labeled pairs):** judge vs human **5/8 agreement,
+  Cohen's κ = +0.25 ("fair", below the 0.6 trust bar)** — on this subtle both-long contrast the pairwise
+  judge is a *weak* proxy for human preference (consistent with its "no preference" verdicts there). n=8 /
+  single labeler = very wide CI, and it does not bear on gross differences (calibration 100% on clear
+  defects) or the judge-independent behavioral findings (sprawl, completion). Takeaway: trust the judge for
+  *direction on clear contrasts*; treat it as a screen on subtle ones and lean on human labels for headline
+  quality claims. See [RESEARCH.md](RESEARCH.md).
 
 ## Tier-2 — controlling the cache-state confound at the source (2026-07-01, live-validated)
 
