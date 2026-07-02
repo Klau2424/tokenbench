@@ -11,6 +11,7 @@ import json
 import math
 import random
 import statistics
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -50,22 +51,66 @@ def lever_label(metric: str) -> str:
 
 # --- cache-aware cost decomposition (the v2 measurement layer) ---------------------------
 #
-# Per-token USD prices for the run's model (Claude Sonnet 4.x). Used ONLY to *decompose* cost
-# onto the input side so a context-reduction technique's saving is visible and priced. The run's
-# reported ``total_cost_usd`` (from Claude Code) stays the dollar source of truth; ``cost_checksum``
-# guards this little table against drifting away from it. Source: Anthropic Claude API pricing —
-# Sonnet $3 / Mtok input, $15 / Mtok output, $0.30 / Mtok cache read.
+# Per-token USD prices, keyed by model family. Used ONLY to *decompose* cost onto the input side so
+# a context-reduction technique's saving is visible and priced. The run's reported ``total_cost_usd``
+# (from Claude Code) stays the dollar source of truth; ``cost_checksum`` guards this table against
+# drifting. Records carry ``rec["model"]`` (set by runner.parse_result), so a run priced at the
+# wrong model — e.g. an Opus judge protocol priced at Sonnet rates — is the bug this map prevents.
 #
-# Cache *creation* is $6 / Mtok (= 2x base input): Claude Code provisions the **1-hour** cache, not
-# the 5-min ($3.75) tier. This was confirmed empirically — the v2 cost-checksum flagged a 28% gap
-# at the 5-min rate, and backing the residual out of real reported costs gave 6.04/Mtok (2.01x). A
-# small Haiku helper model (~$0.0005/run) is the remaining <1% the checksum absorbs.
-PRICE_INPUT = 3.0e-6
-PRICE_OUTPUT = 15.0e-6
-PRICE_CACHE_READ = 0.30e-6
-PRICE_CACHE_CREATION = 6.0e-6
+# Prices verified against the Anthropic Claude API reference (2026): Opus $5/$25, Sonnet $3/$15,
+# Haiku $1/$5 per Mtok (input/output). Cache read = 0.1x input. Cache *creation* = 2x base input:
+# Claude Code provisions the **1-hour** cache, not the 5-min (1.25x) tier — confirmed empirically
+# (the v2 checksum flagged a 28% gap at the 5-min rate; the real residual backed out to ~2.01x).
+@dataclass(frozen=True)
+class Prices:
+    input: float
+    output: float
+    cache_read: float
+    cache_creation: float          # 1-hour cache write = 2x base input
+
+
+PRICES: dict[str, Prices] = {
+    "sonnet": Prices(3.0e-6, 15.0e-6, 0.30e-6, 6.0e-6),
+    "opus":   Prices(5.0e-6, 25.0e-6, 0.50e-6, 10.0e-6),
+    "haiku":  Prices(1.0e-6,  5.0e-6, 0.10e-6,  2.0e-6),
+}
+_DEFAULT_PRICE_MODEL = "sonnet"    # our task runs are Sonnet; unknown models fall back here + a flag
+
+# Back-compat aliases for the default (Sonnet) row — prefer ``prices_for(model)`` in new code.
+PRICE_INPUT = PRICES[_DEFAULT_PRICE_MODEL].input
+PRICE_OUTPUT = PRICES[_DEFAULT_PRICE_MODEL].output
+PRICE_CACHE_READ = PRICES[_DEFAULT_PRICE_MODEL].cache_read
+PRICE_CACHE_CREATION = PRICES[_DEFAULT_PRICE_MODEL].cache_creation
 # Relative gap between our priced total and Claude's reported total above which we flag drift.
 PRICE_CHECKSUM_TOL = 0.25
+
+
+def normalize_model(model: str | None) -> str | None:
+    """Map a model id/name to a price-table family (``sonnet``/``opus``/``haiku``), or ``None`` if
+    unrecognized. Handles bare names and full ids (e.g. ``claude-opus-4-8`` -> ``opus``)."""
+    m = (model or "").lower()
+    if "opus" in m:
+        return "opus"
+    if "haiku" in m:
+        return "haiku"
+    if "sonnet" in m:
+        return "sonnet"
+    return None
+
+
+def prices_for(model: str | None) -> Prices:
+    """Prices for a record's model, falling back to the default (Sonnet) row for unknown models.
+    Pair with :func:`is_known_model` in reports to flag the silent fallback rather than mis-price."""
+    return PRICES[normalize_model(model) or _DEFAULT_PRICE_MODEL]
+
+
+def is_known_model(model: str | None) -> bool:
+    return normalize_model(model) is not None
+
+
+def unknown_models(records: Iterable[dict]) -> set:
+    """Distinct model strings in ``records`` not in the price table — priced at the fallback rate."""
+    return {r.get("model") for r in records if not is_known_model(r.get("model"))}
 
 # Relative gap in arms' output length above which a (length-rewarding) judge delta is flagged
 # as possibly length-confounded in the report — the cue to read the pairwise verdict instead.
@@ -79,16 +124,17 @@ def input_cost_usd(rec: dict) -> float:
     cache_read (per-turn re-injection), so this is the cost the technique actually moves. Output
     is deliberately excluded — it is the v1 lever and a confound here.
     """
+    p = prices_for(rec.get("model"))
     return (
-        (rec.get("input_tokens", 0) or 0) * PRICE_INPUT
-        + (rec.get("cache_creation_tokens", 0) or 0) * PRICE_CACHE_CREATION
-        + (rec.get("cache_read_tokens", 0) or 0) * PRICE_CACHE_READ
+        (rec.get("input_tokens", 0) or 0) * p.input
+        + (rec.get("cache_creation_tokens", 0) or 0) * p.cache_creation
+        + (rec.get("cache_read_tokens", 0) or 0) * p.cache_read
     )
 
 
 def predicted_total_cost_usd(rec: dict) -> float:
     """Our priced reconstruction of the whole run cost (input side + output)."""
-    return input_cost_usd(rec) + (rec.get("output_tokens", 0) or 0) * PRICE_OUTPUT
+    return input_cost_usd(rec) + (rec.get("output_tokens", 0) or 0) * prices_for(rec.get("model")).output
 
 
 def cost_checksum(rec: dict) -> float | None:
@@ -664,6 +710,7 @@ def compare_arms(records: list[dict], baseline: str, treatment: str,
         "deltas": deltas,
         "primary_metric": primary_metric,
         "cost_checksum": cost_check,
+        "unknown_models": sorted(m for m in unknown_models(base_recs + treat_recs) if m),
         "cohens_d": d,
         "welch_t": ttest["t"],
         "welch_df": ttest["df"],
@@ -765,6 +812,12 @@ def format_report(comparison: dict) -> str:
         lines.append(
             f"  ! cost-checksum: priced decomposition is {cck * 100:.0f}% off Claude's reported "
             f"total (>{PRICE_CHECKSUM_TOL * 100:.0f}%) — price table may be stale"
+        )
+    unknown = comparison.get("unknown_models")
+    if unknown:
+        lines.append(
+            f"  ! unknown model(s) {', '.join(unknown)} priced at the {_DEFAULT_PRICE_MODEL} "
+            f"fallback rate — input_cost may be wrong; add them to PRICES"
         )
 
     # Quality axis — the v1 addition: a token cut is only good if coverage holds.
@@ -1128,15 +1181,12 @@ def budget_breakdown(records: list[dict]) -> dict | None:
     def avg(fn) -> float:
         return sum(fn(r) for r in recs) / n
 
-    cache_cost = avg(lambda r: (r.get("cache_creation_tokens", 0) or 0) * PRICE_CACHE_CREATION
-                     + (r.get("cache_read_tokens", 0) or 0) * PRICE_CACHE_READ)
-    out_cost = avg(lambda r: (r.get("output_tokens", 0) or 0) * PRICE_OUTPUT)
-    in_cost = avg(lambda r: (r.get("input_tokens", 0) or 0) * PRICE_INPUT)
-    task_cost = avg(lambda r: r.get("total_cost_usd") or (
-        (r.get("cache_creation_tokens", 0) or 0) * PRICE_CACHE_CREATION
-        + (r.get("cache_read_tokens", 0) or 0) * PRICE_CACHE_READ
-        + (r.get("output_tokens", 0) or 0) * PRICE_OUTPUT
-        + (r.get("input_tokens", 0) or 0) * PRICE_INPUT))
+    # Per-record, model-aware pricing (a mixed-model batch prices each run at its own rates).
+    cache_cost = avg(lambda r: (r.get("cache_creation_tokens", 0) or 0) * prices_for(r.get("model")).cache_creation
+                     + (r.get("cache_read_tokens", 0) or 0) * prices_for(r.get("model")).cache_read)
+    out_cost = avg(lambda r: (r.get("output_tokens", 0) or 0) * prices_for(r.get("model")).output)
+    in_cost = avg(lambda r: (r.get("input_tokens", 0) or 0) * prices_for(r.get("model")).input)
+    task_cost = avg(lambda r: r.get("total_cost_usd") or predicted_total_cost_usd(r))
     judged = [r for r in recs if r.get("judge_cost_usd") is not None]
     judge_cost = (sum(r.get("judge_cost_usd", 0.0) or 0.0 for r in judged) / len(judged)
                   if judged else 0.0)
@@ -1182,6 +1232,10 @@ def format_budget_report(records: list[dict], label: str = "") -> str:
         lines.append("  -> adaptive sampling cuts judge calls; the task cache is fixed.")
     else:
         lines.append("(no judged runs here — run with --judge to see judge spend, the cuttable part.)")
+    unknown = sorted(m for m in unknown_models(valid_records(records)) if m)
+    if unknown:
+        lines.append(f"  ! unknown model(s) {', '.join(unknown)} priced at the {_DEFAULT_PRICE_MODEL} "
+                     f"fallback rate — add them to PRICES")
     return "\n".join(lines)
 
 

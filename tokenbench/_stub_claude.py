@@ -153,7 +153,9 @@ def main() -> int:
     cache_read = 12000 + ctx_tokens * 3 + rng.randint(-300, 300)   # re-injected across ~3 turns
     cache_creation = 4000 + ctx_tokens + rng.randint(-100, 100)    # written once on cold load
 
-    # Rough Sonnet-ish blended cost just so the field is populated in dry runs.
+    # Rough Sonnet-ish blended cost just so the field is populated in dry runs. These literals are
+    # DRY-RUN-ONLY and non-authoritative — the real price table is stats.PRICES; the stub stays a
+    # standalone fake binary (imports nothing from the package) and its numbers are never verdicts.
     cost = (
         input_tokens * 3e-6
         + output_tokens * 15e-6
