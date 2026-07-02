@@ -679,6 +679,11 @@ one task type — broader generalization (more models/tasks) is still untested.
   and `pairwise --arms a,b`; 99 tests.
 - **Next generalization lever:** a second *model* (or a third fixture / a non-explain task), and a
   JSON-repair/retry on the pairwise judge so long artifacts stop dropping out.
+- **Backlog — multi-labeler anchor (deferred 2026-07-01):** extend the human anchor from one labeler to
+  several to measure the **inter-human ceiling** — judge-vs-human κ=0.25 is uninterpretable without it (if
+  humans agree with each other only ~0.3 on this hard contrast, the judge is near-ceiling, not weak). Build
+  `anchor consensus` (mean pairwise Cohen's κ across humans + judge-vs-majority κ); also κ the easier
+  free-trim contrast. Friends label independently on copies of the same blinded sheet.
 - **v3:** package a proven technique as a Claude Code skill — but v2+generalization show the honest
   "technique" is **"keep a tight prescriptive convention"** (it constrains cost, buys quality, and holds
   on two fixtures), not "make the context short." Do NOT ship until it provides real value.
