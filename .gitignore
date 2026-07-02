@@ -19,3 +19,6 @@ fixtures/**/NOTES.md
 # Throwaway dry-run output (stub data, never real results)
 results/*-dryrun/
 results/*dryrun*/
+
+# Human-anchor label sheets: hand-edited working files (the kappa result goes in RESEARCH.md)
+results/anchor/

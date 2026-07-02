@@ -305,6 +305,23 @@ convention copied **byte-for-byte** (tested). New `context-decompose-statistics`
 is a single replication (one model, one task type); broader generalization (more models/tasks) and a
 JSON-repair pass on the judge are the next levers. See [RESEARCH.md](RESEARCH.md).
 
+## Tier-3 — the metrics we weren't capturing (2026-07-01; human-κ run pending your labels)
+
+The third review axis: metrics, not stats or confounds. Built only the parts that close a real gap;
+the rest (Bradley-Terry, faithfulness, mixed-effects) is scoped-and-deferred on purpose.
+
+- **Phase A — $0 judge-reliability + reporting diagnostics.** `pairwise` now reports **swap-consistency**
+  (A/B orders agree — position-bias reliability), **longer-answer win-rate** (standing verbosity readout),
+  and **salvage rate**. `robust` now shows **latency p50/p95/p99, tokens/s, and tail (p95) cost** per arm
+  (`stats.percentiles`). Removed a dead `raw_bvar`.
+- **Phase B — human anchor (`tokenbench/anchor.py`, `anchor sample`/`score`).** Our judge was validated
+  only against *synthetic* perturbations; this measures whether it agrees with a **human on real
+  artifacts**. `sample` pulls blinded real pairs and writes a fill-in `.md` sheet ($0); `score` re-judges
+  them (both orders, position-cancelled) and reports **Cohen's κ** (`stats.cohens_kappa`) vs your labels.
+- +12 tests (now 128). **Pending:** you label ~8–12 pairs, then `anchor score` (~$1) gives the first
+  non-synthetic judge validation. Deferred: a faithfulness/correctness metric (needs its own calibration).
+  See [RESEARCH.md](RESEARCH.md).
+
 ## Tier-2 — controlling the cache-state confound at the source (2026-07-01, live-validated)
 
 Tier-1 made us *robust to* the cache-state confound; Tier-2 *removes it*. **Live A/B (context-lean,

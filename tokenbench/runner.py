@@ -421,6 +421,10 @@ def pairwise_judge(exp: Experiment, base_cmd: list[str] | None = None, dry_run: 
     treat_wins = base_wins = ties = 0
     judge_cost_usd = 0.0
     judge_calls = 0
+    # Phase-A judge-reliability diagnostics.
+    swap_agree = 0          # orders agreed (pref1==pref2): position-bias reliability
+    salvaged_calls = 0      # compare() replies that needed salvage (stochastic parse failures)
+    longer_wins = decisive = 0   # of decisive pairs, how often the LONGER artifact won (verbosity)
     for idx, (b, t) in enumerate(pairs):
         try:
             # Order 1: A=baseline, B=treatment.  Order 2: swapped, to cancel position bias.
@@ -428,6 +432,7 @@ def pairwise_judge(exp: Experiment, base_cmd: list[str] | None = None, dry_run: 
             o2 = scorer.compare(t["artifact_text"], b["artifact_text"])
             judge_cost_usd += (o1.get("cost_usd") or 0.0) + (o2.get("cost_usd") or 0.0)
             judge_calls += 2
+            salvaged_calls += int(bool(o1.get("salvaged"))) + int(bool(o2.get("salvaged")))
             pref1 = _arm_pref(o1["winner"], treat_is="B")
             pref2 = _arm_pref(o2["winner"], treat_is="A")
         except Exception as e:  # noqa: BLE001 - one bad pair must not abort the batch
@@ -442,11 +447,18 @@ def pairwise_judge(exp: Experiment, base_cmd: list[str] | None = None, dry_run: 
         else:  # split (position-sensitive) or any tie
             outcome = "tie"
             ties += 1
+        swap_agree += int(pref1 == pref2)
+        if outcome != "tie":                          # verbosity: did the longer artifact win?
+            decisive += 1
+            lb, lt = len(b.get("artifact_text") or ""), len(t.get("artifact_text") or "")
+            if lb != lt:
+                longer = base_arm if lb > lt else treat_arm
+                longer_wins += int(outcome == longer)
         decisions.append({
             "pair_index": idx,
             "base_run_index": b.get("run_index"), "treat_run_index": t.get("run_index"),
             "order1_winner_arm": pref1, "order2_winner_arm": pref2,
-            "outcome": outcome,
+            "outcome": outcome, "salvaged": bool(o1.get("salvaged") or o2.get("salvaged")),
             "order1_reason": o1.get("reason"), "order2_reason": o2.get("reason"),
         })
         print(f"[pair {idx}] {base_arm} vs {treat_arm}: {pref1}/{pref2} -> {outcome}", flush=True)
@@ -467,6 +479,10 @@ def pairwise_judge(exp: Experiment, base_cmd: list[str] | None = None, dry_run: 
         "treatment_win_rate": win_rate,
         "base_mean_output": _mean_out(base_rows), "treat_mean_output": _mean_out(treat_rows),
         "judge_cost_usd": judge_cost_usd, "judge_calls": judge_calls,
+        # Phase-A diagnostics: how reliable was this judging pass?
+        "swap_consistency": (swap_agree / decided) if decided else None,
+        "salvage_rate": (salvaged_calls / judge_calls) if judge_calls else None,
+        "longer_answer_win_rate": (longer_wins / decisive) if decisive else None,
         "seed": seed,
     }
 

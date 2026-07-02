@@ -171,6 +171,52 @@ def _cmd_robust(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_anchor(args: argparse.Namespace) -> int:
+    # Validate the pairwise judge against HUMAN labels on real artifacts (Cohen's kappa).
+    #   sample -> writes a blinded label sheet ($0); score -> re-judges the labeled pairs (~$1).
+    from . import anchor
+    from .runner import STUB, _temp_cwd_runner
+    exp = get_experiment(args.exp)
+    stem = exp.results_dir / "anchor" / exp.id
+    stem.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.mode == "sample":
+        judged = replace(exp, id=exp.id + "-judged")
+        path = judged.runs_file() if judged.runs_file().exists() else exp.runs_file()
+        if not path.exists():
+            print(f"no runs at {path}; run `--judge` first so artifacts are saved", file=sys.stderr)
+            return 1
+        base = args.baseline or exp.arms[0].name
+        treat = args.treatment or exp.arms[-1].name
+        if args.arms:
+            parts = [s.strip() for s in args.arms.split(",")]
+            if len(parts) != 2:
+                print(f"--arms expects 'base,treat', got {args.arms!r}", file=sys.stderr)
+                return 1
+            base, treat = parts
+        pairs = anchor.sample_pairs(stats.load_records(path), base, treat, n=args.n, seed=args.seed)
+        if not pairs:
+            print(f"no paired artifacts for {base!r} vs {treat!r} in {path}", file=sys.stderr)
+            return 1
+        md, _ = anchor.write_label_sheet(pairs, exp.prompt, stem)
+        print(f"wrote {len(pairs)} blinded pairs ({base} vs {treat}) -> {md}\n"
+              f"fill each VERDICT[i]= with A / B / tie, then: "
+              f"python -m tokenbench anchor score --exp {args.exp}"
+              + (" --dry-run" if args.dry_run else ""))
+        return 0
+
+    # mode == score
+    if not stem.with_suffix(".jsonl").exists():
+        print(f"no label sheet at {stem}.md; run `anchor sample --exp {args.exp}` first", file=sys.stderr)
+        return 1
+    base_cmd = [sys.executable, str(STUB)] if args.dry_run else ["claude"]
+    run_fn = _temp_cwd_runner(exp)
+    mode = "DRY (stub judge, $0)" if args.dry_run else "REAL (judge tokens ~\\$1)"
+    print(f"== anchor score {exp.id} : {mode} ==", flush=True)
+    print(anchor.format_anchor_report(anchor.score_anchor(stem, exp.prompt, run_fn, base_cmd)))
+    return 0
+
+
 def _cmd_report(args: argparse.Namespace) -> int:
     exp = get_experiment(args.exp)
     runs_path = exp.runs_file()
@@ -258,6 +304,19 @@ def main(argv: list[str] | None = None) -> int:
     p_robust.add_argument("--baseline", default=None, help="baseline arm (default: first arm)")
     p_robust.add_argument("--treatment", default=None, help="treatment arm (default: second arm)")
     p_robust.set_defaults(func=_cmd_robust)
+
+    p_anchor = sub.add_parser("anchor",
+                              help="validate the judge against human labels on real artifacts (Cohen's kappa)")
+    p_anchor.add_argument("mode", choices=["sample", "score"],
+                          help="sample: write a blinded label sheet ($0); score: judge-vs-human kappa (~$1)")
+    p_anchor.add_argument("--exp", choices=choices, default=DEFAULT_EXPERIMENT)
+    p_anchor.add_argument("--arms", default=None, help="'base,treat' arm pair to sample (default: first vs last)")
+    p_anchor.add_argument("--baseline", default=None, help="baseline arm (default: first)")
+    p_anchor.add_argument("--treatment", default=None, help="treatment arm (default: last)")
+    p_anchor.add_argument("--n", type=int, default=15, help="pairs to sample (default 15)")
+    p_anchor.add_argument("--seed", type=int, default=0, help="blinding/sampling seed")
+    p_anchor.add_argument("--dry-run", action="store_true", help="score with the $0 stub judge")
+    p_anchor.set_defaults(func=_cmd_anchor)
 
     p_report = sub.add_parser("report", help="re-print the report from saved runs")
     p_report.add_argument("--exp", choices=choices, default=DEFAULT_EXPERIMENT,

@@ -166,6 +166,8 @@ python -m tokenbench run --exp context-decompose-statistics --confirm-spend  # g
 python -m tokenbench pairwise --exp context-decompose-statistics --arms verbose,lean-costly  # any cross-arm pairwise contrast
 python -m tokenbench run --exp context-lean --warmup    # Tier-2: warm the cache per run (kills the cold/warm cost confound)
 python -m tokenbench robust --exp context-decompose-statistics  # Tier-1 robust/paired stats (IQM, sign-flip, BCa, MDE, completion)
+python -m tokenbench anchor sample --exp context-costly --n 12   # Tier-3: write a blinded human-label sheet
+python -m tokenbench anchor score --exp context-costly           # then: judge-vs-human agreement (Cohen's kappa)
 python -m tokenbench calibrate --dry-run    # $0 self-test: harness flags the length-biased stub judge
 python -m tokenbench calibrate              # characterize the judge vs a synthetic gold set (sensitivity + length-resistance)
 ```

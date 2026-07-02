@@ -463,6 +463,42 @@ def min_detectable_effect_d(n: int, z_alpha: float = Z_ALPHA_TWO_SIDED_05,
     return (z_alpha + z_power) * math.sqrt(2.0 / n)
 
 
+def cohens_kappa(a: list, b: list) -> dict | None:
+    """Cohen's kappa: chance-corrected agreement between two raters over nominal labels (e.g. the
+    pairwise judge vs a human, each in {A, B, tie}). ``kappa = (po - pe)/(1 - pe)`` — 1 = perfect,
+    0 = chance-level, <0 = worse than chance. Returns raw agreement ``po`` and expected ``pe`` too.
+    Returns ``None`` for empty/mismatched input. Pure stdlib — this validates the judge against a
+    human anchor without pulling in scikit-learn."""
+    n = len(a)
+    if n == 0 or len(b) != n:
+        return None
+    cats = set(a) | set(b)
+    po = sum(1 for x, y in zip(a, b) if x == y) / n
+    ca = {c: sum(1 for x in a if x == c) / n for c in cats}
+    cb = {c: sum(1 for x in b if x == c) / n for c in cats}
+    pe = sum(ca[c] * cb[c] for c in cats)
+    kappa = 1.0 if po == 1.0 else (0.0 if pe >= 1.0 else (po - pe) / (1 - pe))
+    return {"kappa": kappa, "po": po, "pe": pe, "n": n}
+
+
+def percentiles(values: list[float], ps: tuple = (50, 95, 99)) -> dict:
+    """Linear-interpolated percentiles (inclusive) for a metric — means hide the tails that matter
+    for latency and budgeting. Returns ``{p: value}``; empty input -> all ``None``."""
+    xs = sorted(values)
+    n = len(xs)
+    if n == 0:
+        return {p: None for p in ps}
+    out = {}
+    for p in ps:
+        if n == 1:
+            out[p] = xs[0]
+            continue
+        rank = (p / 100.0) * (n - 1)
+        lo = int(rank)
+        out[p] = xs[lo] + (rank - lo) * (xs[min(lo + 1, n - 1)] - xs[lo])
+    return out
+
+
 def cuped_adjust(y: list[float], x: list[float], groups: list | None = None) -> dict | None:
     """CUPED variance reduction (Deng et al. 2013): remove the covariate-predicted part of Y.
 
@@ -871,8 +907,6 @@ def robust_analysis(records: list[dict], baseline: str, treatment: str,
             t_adj = {ri: v for (arm, ri), v in akey.items() if arm == treatment}
             common = sorted(set(b_adj) & set(t_adj))
             adj_deltas = [b_adj[i] - t_adj[i] for i in common]
-            raw_bvar = statistics.variance([r[primary_metric] for r in base_recs
-                                            if r["arm"] == baseline]) if len(base_recs) > 1 else None
             cuped = {
                 "covariate": covariate, "rho": adj["rho"], "var_reduction": adj["var_reduction"],
                 "theta": adj["theta"], "n_used": len(cov_recs),
@@ -887,6 +921,17 @@ def robust_analysis(records: list[dict], baseline: str, treatment: str,
         done = sum(1 for r in typed if r.get("valid") and r.get("artifact_text") is not None)
         return {**wilson_ci(done, len(typed)), "completed": done, "attempted": len(typed)}
 
+    def dist(recs: list[dict]) -> dict:
+        dur = [r["duration_ms"] / 1000.0 for r in recs if isinstance(r.get("duration_ms"), (int, float))]
+        cost = [r["total_cost_usd"] for r in recs if isinstance(r.get("total_cost_usd"), (int, float))]
+        tps = [r["output_tokens"] / (r["duration_ms"] / 1000.0) for r in recs
+               if r.get("duration_ms") and isinstance(r.get("output_tokens"), (int, float))]
+        return {
+            "latency_s": percentiles(dur) if dur else None,
+            "cost_p95": percentiles(cost, (95,))[95] if cost else None,
+            "tokens_per_s": statistics.median(tps) if tps else None,
+        }
+
     return {
         "baseline": baseline, "treatment": treatment, "metric": primary_metric,
         "is_cost": primary_metric in COST_METRICS,
@@ -896,6 +941,7 @@ def robust_analysis(records: list[dict], baseline: str, treatment: str,
         "welch": welch_ttest(bvals, tvals),                  # unpaired reference (shows pairing gain)
         "mde_d": min_detectable_effect_d(min(len(base_recs), len(treat_recs))),
         "completion": {baseline: completion(baseline), treatment: completion(treatment)},
+        "distributions": {baseline: dist(base_recs), treatment: dist(treat_recs)},
     }
 
 
@@ -958,6 +1004,18 @@ def format_robust_report(a: dict) -> str:
             return f"{x['completed']}/{x['attempted']} = {x['phat']*100:.0f}% [Wilson {x['lo']*100:.0f}-{x['hi']*100:.0f}%]"
         L.append("")
         L.append(f"task completion (wrote the artifact):  {base} {_c(comp[base])}   {treat} {_c(comp[treat])}")
+    dists = a.get("distributions")
+    if dists:
+        L.append("")
+        L.append("distributions (per arm — means hide tails):")
+        for arm in (base, treat):
+            d = dists.get(arm) or {}
+            lat = d.get("latency_s")
+            lat_s = (f"latency p50/p95/p99 {lat[50]:.1f}/{lat[95]:.1f}/{lat[99]:.1f}s"
+                     if lat else "latency n/a")
+            tps = f"  {d['tokens_per_s']:.0f} tok/s" if d.get("tokens_per_s") else ""
+            tail = f"  tail cost p95 ${d['cost_p95']:.4f}" if d.get("cost_p95") is not None else ""
+            L.append(f"  {arm:12} {lat_s}{tps}{tail}")
     L.append("")
     L.append("reading: IQM/median are outlier-robust; the paired sign-flip is the cache-matched "
              "significance test (assumption-light); BCa CIs are skew-corrected. A wide MDE at small n "
@@ -1031,6 +1089,20 @@ def format_pairwise_report(summary: dict) -> str:
             f"output length: {base} {_fmt_tokens(bo)} vs {treat} {_fmt_tokens(to)} tokens "
             f"({gap:.0f}% apart) — pairwise is the length-robust read of the absolute judge delta"
         )
+
+    # Phase-A judge-reliability diagnostics.
+    sc = summary.get("swap_consistency")
+    law = summary.get("longer_answer_win_rate")
+    sr = summary.get("salvage_rate")
+    if sc is not None or law is not None:
+        parts = []
+        if sc is not None:
+            parts.append(f"swap-consistency {sc * 100:.0f}% (A/B orders agree; low = position bias)")
+        if law is not None:
+            parts.append(f"longer-answer win-rate {law:.2f} (0.50 = length-neutral)")
+        if sr:
+            parts.append(f"salvaged {sr * 100:.0f}% of judge replies")
+        lines.append("reliability: " + "  |  ".join(parts))
 
     lines.append("")
     lines.append("limitations: blind pairwise judge, both A/B orders (position-controlled) but still")
