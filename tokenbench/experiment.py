@@ -11,7 +11,7 @@ so the runner can score output *coverage* — the quality axis a token cut is ju
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import quality
@@ -288,6 +288,32 @@ def get_experiment(name: str) -> Experiment:
     if name not in EXPERIMENTS:
         raise KeyError(f"unknown experiment {name!r}; choices: {', '.join(EXPERIMENTS)}")
     return EXPERIMENTS[name]()
+
+
+# --- results routing: the id-suffix grammar in ONE place ---------------------------------
+#
+# A run's results dir is ``results/<id><suffix>/``. Judged runs add ``-judged``, dry runs add
+# ``-dryrun`` (pairwise adds ``-pairwise`` in the runner). Before this, seven CLI commands each
+# hand-concatenated these suffixes and re-implemented "prefer the -judged dir, else the plain one".
+
+def variant(exp: Experiment, *, judged: bool = False, dry_run: bool = False) -> Experiment:
+    """The same experiment with the ``-judged`` / ``-dryrun`` id suffixes applied — the single
+    source of the suffix grammar. Writers pass the result to the runner (which keys output dirs off
+    ``exp.id``); readers usually want :func:`resolve_runs` instead."""
+    suffix = ("-judged" if judged else "") + ("-dryrun" if dry_run else "")
+    return replace(exp, id=exp.id + suffix) if suffix else exp
+
+
+def runs_path(exp: Experiment, *, judged: bool = False, dry_run: bool = False) -> Path:
+    """Path to a variant's ``runs.jsonl`` (deterministic; does not check existence)."""
+    return variant(exp, judged=judged, dry_run=dry_run).runs_file()
+
+
+def resolve_runs(exp: Experiment) -> Path:
+    """Read policy for the report/analysis commands: prefer the ``-judged`` runs (they carry
+    artifact_text + judge fields), fall back to the plain runs."""
+    judged = runs_path(exp, judged=True)
+    return judged if judged.exists() else runs_path(exp)
 
 
 def v0_experiment() -> Experiment:

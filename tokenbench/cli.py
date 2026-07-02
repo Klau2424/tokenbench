@@ -8,7 +8,7 @@ import sys
 from dataclasses import replace
 
 from . import stats
-from .experiment import DEFAULT_EXPERIMENT, EXPERIMENTS, get_experiment
+from .experiment import DEFAULT_EXPERIMENT, EXPERIMENTS, get_experiment, resolve_runs, variant
 from .runner import pairwise_judge, rejudge, run_experiment
 
 
@@ -18,10 +18,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         exp = replace(exp, n=args.n)
     # --judge adds a token-costing LLM quality grade; keep its richer data in its own dir so
     # it never clobbers the coverage-only results. Dry runs likewise stay isolated.
-    if args.judge:
-        exp = replace(exp, id=exp.id + "-judged")
-    if args.dry_run:
-        exp = replace(exp, id=exp.id + "-dryrun")
+    exp = variant(exp, judged=args.judge, dry_run=args.dry_run)
     # Spend gate: a multi-arm experiment (e.g. context-decompose) burns 3x+ the tokens, so it must
     # not run for real by accident — require an explicit --confirm-spend. Dry runs are always allowed.
     if not args.dry_run and len(exp.arms) > 2 and not args.confirm_spend:
@@ -46,7 +43,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 def _cmd_judge(args: argparse.Namespace) -> int:
     # Re-score already-saved artifacts (the run used --judge, so artifact_text is stored).
     # Spends judge tokens only — no task re-runs — to tighten noisy judge numbers.
-    exp = replace(get_experiment(args.exp), id=get_experiment(args.exp).id + "-judged")
+    exp = variant(get_experiment(args.exp), judged=True)
     runs_path = exp.runs_file()
     if not runs_path.exists():
         print(f"no judged runs at {runs_path}; run "
@@ -65,8 +62,7 @@ def _cmd_budget(args: argparse.Namespace) -> int:
     # Spend breakdown: where the tokens actually go (task cache vs output vs judge). Prefers the
     # -judged dir (judge spend is only recorded there); falls back to the plain runs.
     exp = get_experiment(args.exp)
-    judged = replace(exp, id=exp.id + "-judged")
-    path = judged.runs_file() if judged.runs_file().exists() else exp.runs_file()
+    path = resolve_runs(exp)
     if not path.exists():
         print(f"no runs at {path}; run `python -m tokenbench run --exp {args.exp}` first",
               file=sys.stderr)
@@ -78,9 +74,7 @@ def _cmd_budget(args: argparse.Namespace) -> int:
 def _cmd_pairwise(args: argparse.Namespace) -> int:
     # Blind pairwise re-judge of saved artifacts (judge tokens only) — de-confounds the absolute
     # judge's length bias. Reads the same -judged dir the artifacts were saved to.
-    exp = replace(get_experiment(args.exp), id=get_experiment(args.exp).id + "-judged")
-    if args.dry_run:
-        exp = replace(exp, id=exp.id + "-dryrun")
+    exp = variant(get_experiment(args.exp), judged=True, dry_run=args.dry_run)
     if not exp.runs_file().exists():
         print(f"no judged runs at {exp.runs_file()}; run "
               f"`python -m tokenbench run --judge --exp {args.exp}` first", file=sys.stderr)
@@ -109,8 +103,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
         print(f"{args.exp} is not a 3-arm experiment; decompose needs verbose/lean/lean-costly",
               file=sys.stderr)
         return 1
-    judged = replace(exp, id=exp.id + "-judged")
-    path = judged.runs_file() if judged.runs_file().exists() else exp.runs_file()
+    path = resolve_runs(exp)
     if not path.exists():
         print(f"no runs at {path}; run `python -m tokenbench run --exp {args.exp} "
               f"--confirm-spend` first (or --dry-run)", file=sys.stderr)
@@ -158,8 +151,7 @@ def _cmd_robust(args: argparse.Namespace) -> int:
     # test with BCa CIs, minimum detectable effect, and task-completion (Wilson). Prefers the -judged
     # dir (it carries artifact_text, needed for the completion rate); falls back to the plain runs.
     exp = get_experiment(args.exp)
-    judged = replace(exp, id=exp.id + "-judged")
-    path = judged.runs_file() if judged.runs_file().exists() else exp.runs_file()
+    path = resolve_runs(exp)
     if not path.exists():
         print(f"no runs at {path}; run `python -m tokenbench run --exp {args.exp}` first",
               file=sys.stderr)
@@ -181,8 +173,7 @@ def _cmd_anchor(args: argparse.Namespace) -> int:
     stem.parent.mkdir(parents=True, exist_ok=True)
 
     if args.mode == "sample":
-        judged = replace(exp, id=exp.id + "-judged")
-        path = judged.runs_file() if judged.runs_file().exists() else exp.runs_file()
+        path = resolve_runs(exp)
         if not path.exists():
             print(f"no runs at {path}; run `--judge` first so artifacts are saved", file=sys.stderr)
             return 1
