@@ -10,6 +10,7 @@ from __future__ import annotations
 import atexit
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -340,12 +341,7 @@ def rejudge(exp: Experiment, base_cmd: list[str] | None = None, samples: int = 3
     judge_scorer = _build_judge(exp, base_cmd, samples=samples, adaptive=adaptive)
 
     path = exp.runs_file()
-    records: list[dict] = []
-    with open(path, "r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
+    records = stats.load_records(path)
 
     scored = 0
     for rec in records:
@@ -359,11 +355,23 @@ def rejudge(exp: Experiment, base_cmd: list[str] | None = None, samples: int = 3
                 flush=True,
             )
 
-    with open(path, "w", encoding="utf-8") as fh:
-        for rec in records:
-            fh.write(json.dumps(rec) + "\n")
+    _atomic_write_jsonl(path, records)
     print(f"re-judged {scored} artifacts @ {samples} samples -> {path}", flush=True)
     return path
+
+
+def _atomic_write_jsonl(path: Path, records: list[dict]) -> None:
+    """Rewrite a runs.jsonl **atomically**: write to a sibling temp file, fsync, then ``os.replace``
+    (an atomic rename on the same filesystem). A crash mid-write leaves the original untouched —
+    ``runs.jsonl`` is hours of paid-for token spend, so a truncating in-place ``open(path, "w")`` is
+    a real data-loss path. Only ``rejudge`` rewrites (the run loop only ever appends)."""
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
 
 
 def _arm_artifacts(records: list[dict], arm: str) -> list[dict]:

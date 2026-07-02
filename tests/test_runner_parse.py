@@ -248,6 +248,18 @@ def test_rejudge_rescores_only_saved_valid_artifacts(tmp_path):
     assert "output_tokens" not in out[0]
 
 
+def test_atomic_write_jsonl_roundtrips_and_leaves_no_tmp(tmp_path):
+    # rejudge rewrites runs.jsonl (hours of paid spend) — it must swap a temp file in atomically,
+    # never truncate in place, and leave no .tmp litter behind.
+    p = tmp_path / "runs.jsonl"
+    recs = [{"a": 1}, {"b": 2, "artifact_text": "x"}]
+    runner._atomic_write_jsonl(p, recs)
+    assert [json.loads(ln) for ln in p.read_text().splitlines() if ln] == recs
+    assert not (tmp_path / "runs.jsonl.tmp").exists()
+    runner._atomic_write_jsonl(p, [{"c": 3}])            # a second write cleanly replaces
+    assert [json.loads(ln) for ln in p.read_text().splitlines() if ln] == [{"c": 3}]
+
+
 def test_judge_runner_reuses_one_stable_cwd(tmp_path, monkeypatch):
     """v2.7: every judge call must run in the SAME cwd (so Claude Code's cwd-bearing prompt prefix
     stays cache-warm) — not a fresh mkdtemp per call, which re-paid a cold cache every time."""
